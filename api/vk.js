@@ -1,11 +1,11 @@
-export default async function handler(req, res) {
+export default function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).send("Method Not Allowed");
   }
 
   let body = req.body;
 
-  // На Vercel тело может быть строкой — пробуем распарсить
+  // На всякий случай парсим, если пришла строка
   if (typeof body === "string") {
     try {
       body = JSON.parse(body);
@@ -19,18 +19,18 @@ export default async function handler(req, res) {
 
   const { type, secret } = body || {};
 
-  // проверка, что запрос реально от VK (секрет должен совпадать)
+  // если secret есть и не совпадает — шлём 403
   if (secret && secret !== VK_SECRET) {
     return res.status(403).send("forbidden");
   }
 
   if (type === "confirmation") {
-    // ВАЖНО: вернуть ровно строку, без JSON
+    // ВАЖНО: вернуть ровно строку без JSON и без лишних символов
     res.status(200).setHeader("Content-Type", "text/plain; charset=utf-8");
     return res.send(CONFIRMATION_CODE);
   }
 
-  // остальные события
+  // остальные события — просто ok
   res.status(200).setHeader("Content-Type", "text/plain; charset=utf-8");
   return res.send("ok");
 }
