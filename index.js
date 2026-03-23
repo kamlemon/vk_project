@@ -22,7 +22,7 @@ app.post("/", (req, res) => {
 
   // здесь потом будешь обрабатывать события (message_new и т.д.)
   // пока просто отвечаем ok, чтобы VK не ругался
-  return res.send("ok");
+  return res.send("4d476332");
 });
 
 const PORT = process.env.PORT || 3000;
