@@ -470,6 +470,16 @@ export default async function handler(req, res) {
         } catch(e) {
           console.error('[handler] new-user error:', e.message)
         }
+      } else {
+        try {
+          const m = await import('../api/old-user.js')
+          const { data: userRow } = await supabase.from('user').select('first_name, sex').eq('vk_user_id', vk_user_id).maybeSingle()
+          const fakeReq = { method: 'POST', body: { user_id: vk_user_id, text, first_name: userRow?.first_name || null, sex: userRow?.sex || null } }
+          const fakeRes = { status: () => ({ end: () => {}, send: () => {} }), send: () => {} }
+          await m.default(fakeReq, fakeRes)
+        } catch(e) {
+          console.error('[handler] old-user error:', e.message)
+        }
       }
     }
   }
