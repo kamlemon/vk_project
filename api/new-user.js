@@ -34,11 +34,36 @@ export default async function handler(req, res) {
 
     await log('new-user', 'Gemini ответил', { reply, inputTokens, outputTokens, model: usedModel })
 
-    await supabase.from('message')
-      .insert({ user_id, role: 'assistant', content: reply })
+    // Получаем dialog_id
+    const { data: dialog } = await supabase
+      .from('dialog')
+      .select('id')
+      .eq('vk_user_id', user_id)
+      .eq('status', 'active')
+      .maybeSingle()
 
-    await supabase.from('token_usage')
-      .insert({ user_id, input_tokens: inputTokens, output_tokens: outputTokens })
+    const dialog_id = dialog?.id ?? null
+
+    // Сохраняем ответ ассистента
+    await supabase.from('message').insert({
+      from_id: user_id,
+      peer_id: user_id,
+      text: reply,
+      direction: 'out',
+      dialog_id,
+      is_transcribed: false,
+      sent_at: new Date().toISOString(),
+    })
+
+    // Сохраняем токены
+    await supabase.from('token_usage').insert({
+      vk_user_id: user_id,
+      dialog_id,
+      prompt_tokens: inputTokens,
+      candidates_tokens: outputTokens,
+      total_tokens: inputTokens + outputTokens,
+      model_version: usedModel,
+    })
 
     await sendMessage(user_id, reply)
 
