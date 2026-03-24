@@ -451,7 +451,9 @@ export default async function handler(req, res) {
 
     if (msg) {
       const text = msg.text ?? ''
-      const baseUrl = process.env.VERCEL_URL
+      const baseUrl = process.env.VERCEL_PROJECT_URL
+        ? `https://${process.env.VERCEL_PROJECT_URL}`
+        : process.env.VERCEL_URL
         ? `https://${process.env.VERCEL_URL}`
         : 'http://localhost:3000'
 
