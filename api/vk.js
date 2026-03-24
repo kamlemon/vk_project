@@ -1,162 +1,444 @@
-import { createClient } from "@supabase/supabase-js";
+import { createClient } from '@supabase/supabase-js'
+import { HttpsProxyAgent } from 'https-proxy-agent'
 
-const CONFIRMATION_CODE = "4d476332";
-const VK_SECRET = "kP7sY9q3Wm2Zf8R1tL4vB6nC0xD5gH7jK9pM2rT8";
+// ── Инициализация ────────────────────────────────────────────────────────────
 
-// Инициализируем Supabase-клиент один раз
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_ANON_KEY;
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+)
 
-if (!supabaseUrl || !supabaseKey) {
-  console.warn("Supabase env vars are missing");
+const proxyAgent = new HttpsProxyAgent(process.env.PROXY_URL)
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY
+const GEMINI_URL     = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`
+
+// ── 1. fetchVkUser ───────────────────────────────────────────────────────────
+
+async function fetchVkUser(vkUserId) {
+  const url = new URL('https://api.vk.com/method/users.get')
+  url.searchParams.set('user_ids',     vkUserId)
+  url.searchParams.set('fields',       'sex,city,photo_200,last_seen')
+  url.searchParams.set('access_token', process.env.VK_GROUP_TOKEN)
+  url.searchParams.set('v',            '5.199')
+
+  const res  = await fetch(url.toString())
+  const json = await res.json()
+
+  if (json.error) {
+    throw new Error(`VK API error ${json.error.error_code}: ${json.error.error_msg}`)
+  }
+
+  const u = json.response[0]
+  return {
+    vk_user_id: u.id,
+    first_name: u.first_name,
+    last_name:  u.last_name,
+    sex:        u.sex ?? null,
+    city:       u.city?.title ?? null,
+    photo_200:  u.photo_200 ?? null,
+    last_seen:  u.last_seen?.time
+                  ? new Date(u.last_seen.time * 1000).toISOString()
+                  : null,
+    raw_json:   u,
+  }
 }
 
-const supabase =
-  supabaseUrl && supabaseKey
-    ? createClient(supabaseUrl, supabaseKey)
-    : null;
+// ── 2. ensureUserExists ──────────────────────────────────────────────────────
 
-export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).send("Method Not Allowed");
-  }
+async function ensureUserExists(vkUserId) {
+  const { data: existing, error: selErr } = await supabase
+    .from('user')
+    .select('*')
+    .eq('vk_user_id', vkUserId)
+    .maybeSingle()
 
-  let body = req.body;
+  if (selErr) throw selErr
+  if (existing) return existing
 
-  if (typeof body === "string") {
-    try {
-      body = JSON.parse(body);
-    } catch (e) {
-      return res.status(400).send("Bad Request");
+  let userData
+  try {
+    userData = await fetchVkUser(vkUserId)
+  } catch (vkError) {
+    console.error('[ensureUserExists] fetchVkUser failed:', vkError.message)
+    userData = {
+      vk_user_id:   vkUserId,
+      first_name:   'Unknown',
+      last_name:    '',
+      funnel_stage: 'new',
+      raw_json:     { error: vkError.message },
     }
   }
 
-  const { type, secret, object, group_id, event_id, v } = body || {};
+  const { data: inserted, error: insErr } = await supabase
+    .from('user')
+    .insert(userData)
+    .select()
+    .single()
 
-  // проверка секретного ключа
-  if (secret && secret !== VK_SECRET) {
-    return res.status(403).send("forbidden");
+  if (insErr) throw insErr
+  return inserted
+}
+
+// ── 3. ensureDialogExists ────────────────────────────────────────────────────
+
+async function ensureDialogExists(vkUserId, peerId) {
+  const { data: existing, error: selErr } = await supabase
+    .from('dialog')
+    .select('*')
+    .eq('vk_user_id', vkUserId)
+    .eq('status', 'active')
+    .limit(1)
+    .maybeSingle()
+
+  if (selErr) throw selErr
+  if (existing) return existing
+
+  const { data: inserted, error: insErr } = await supabase
+    .from('dialog')
+    .insert({ vk_user_id: vkUserId, peer_id: peerId, status: 'active' })
+    .select()
+    .single()
+
+  if (insErr) throw insErr
+  return inserted
+}
+
+// ── 4. parseAttachments ──────────────────────────────────────────────────────
+
+function parseAttachments(attachments) {
+  const result = {
+    has_attachments:  false,
+    attachment_types: null,
+    // photo
+    photo_owner_id:   null,
+    photo_id:         null,
+    photo_access_key: null,
+    photo_url:        null,
+    photo_width:      null,
+    photo_height:     null,
+    // audio
+    audio_owner_id:   null,
+    audio_id:         null,
+    audio_access_key: null,
+    audio_duration:   null,
+    audio_link_mp3:   null,
+    audio_link_ogg:   null,
+    // doc
+    doc_owner_id:     null,
+    doc_id:           null,
+    doc_access_key:   null,
+    doc_url:          null,
+    doc_title:        null,
+    doc_ext:          null,
+    // voice (audio_message)
+    voice_owner_id:   null,
+    voice_id:         null,
+    voice_access_key: null,
+    voice_duration:   null,
+    voice_link_ogg:   null,
   }
 
-  // подтверждение сервера
-  if (type === "confirmation") {
-    res.status(200).setHeader("Content-Type", "text/plain; charset=utf-8");
-    return res.send(CONFIRMATION_CODE);
-  }
+  if (!attachments || attachments.length === 0) return result
 
-  console.log("VK EVENT:", JSON.stringify(body, null, 2));
+  result.has_attachments  = true
+  const types             = [...new Set(attachments.map(a => a.type))]
+  result.attachment_types = types.join(',')
 
-  if (type === "message_new") {
-    const msg = object?.message;
-    const fromId = msg?.from_id;
-    const text = msg?.text ?? "";
-    const peerId = msg?.peer_id;
-    const msgDate = msg?.date;
-    const vkMessageId = msg?.id;
-    const convMsgId = msg?.conversation_message_id;
-    const attachments = msg?.attachments ?? [];
+  for (const att of attachments) {
+    switch (att.type) {
 
-    // типы вложений
-    const attachmentTypes = attachments.map((a) => a.type).join(",");
-
-    // фото (ищем type === 'photo' и внутри sizes type === 'base')
-    let photoOwnerId = null;
-    let photoId = null;
-    let photoAccessKey = null;
-    let photoUrl = null;
-    let photoWidth = null;
-    let photoHeight = null;
-
-    const photoAttachment = attachments.find((a) => a.type === "photo");
-    if (photoAttachment && photoAttachment.photo) {
-      const p = photoAttachment.photo;
-      photoOwnerId = p.owner_id ?? null;
-      photoId = p.id ?? null;
-      photoAccessKey = p.access_key ?? null;
-
-      const baseSize =
-        (p.sizes || []).find((s) => s.type === "base") || p.orig_photo;
-
-      if (baseSize) {
-        photoUrl = baseSize.url ?? null;
-        photoWidth = baseSize.width ?? null;
-        photoHeight = baseSize.height ?? null;
+      case 'photo': {
+        if (result.photo_id !== null) break
+        const photo = att.photo
+        const best  = (photo.sizes ?? []).reduce(
+          (max, s) => (s.width > (max?.width ?? 0) ? s : max),
+          null
+        )
+        result.photo_owner_id   = photo.owner_id
+        result.photo_id         = photo.id
+        result.photo_access_key = photo.access_key ?? null
+        result.photo_url        = best?.url ?? null
+        result.photo_width      = best?.width ?? null
+        result.photo_height     = best?.height ?? null
+        break
       }
+
+      case 'audio': {
+        if (result.audio_id !== null) break
+        const audio             = att.audio
+        result.audio_owner_id   = audio.owner_id
+        result.audio_id         = audio.id
+        result.audio_access_key = audio.access_key ?? null
+        result.audio_duration   = audio.duration ?? null
+        result.audio_link_mp3   = audio.url ?? null
+        result.audio_link_ogg   = audio.url_ogg ?? null
+        break
+      }
+
+      case 'doc': {
+        if (result.doc_id !== null) break
+        const doc             = att.doc
+        result.doc_owner_id   = doc.owner_id
+        result.doc_id         = doc.id
+        result.doc_access_key = doc.access_key ?? null
+        result.doc_url        = doc.url ?? null
+        result.doc_title      = doc.title ?? null
+        result.doc_ext        = doc.ext ?? null
+        break
+      }
+
+      case 'audio_message': {
+        if (result.voice_id !== null) break
+        const vm                = att.audio_message
+        result.voice_owner_id   = vm.owner_id
+        result.voice_id         = vm.id
+        result.voice_access_key = vm.access_key ?? null
+        result.voice_duration   = vm.duration ?? null
+        result.voice_link_ogg   = vm.link_ogg ?? null
+        break
+      }
+
+      default:
+        break
+    }
+  }
+
+  return result
+}
+
+// ── 5. transcribeAttachment ──────────────────────────────────────────────────
+
+async function transcribeAttachment(attachmentFields, attachmentTypes) {
+  const empty = { transcription: null, gemini_response_id: null, usageMetadata: null }
+
+  if (!attachmentTypes) return empty
+
+  const types = attachmentTypes.split(',')
+
+  try {
+    let parts = null
+
+    if (types.includes('audio_message') && attachmentFields.voice_link_ogg) {
+      const audioRes    = await fetch(attachmentFields.voice_link_ogg)
+      const audioBuffer = await audioRes.arrayBuffer()
+      const base64      = Buffer.from(audioBuffer).toString('base64')
+      parts = [
+        { inline_data: { mime_type: 'audio/ogg', data: base64 } },
+        { text: 'Транскрибируй это голосовое сообщение. Верни только текст, без пояснений.' },
+      ]
+    } else if (types.includes('photo') && attachmentFields.photo_url) {
+      const imgRes    = await fetch(attachmentFields.photo_url)
+      const imgBuffer = await imgRes.arrayBuffer()
+      const base64    = Buffer.from(imgBuffer).toString('base64')
+      parts = [
+        { inline_data: { mime_type: 'image/jpeg', data: base64 } },
+        { text: 'Опиши детально что изображено на фото. Отвечай на русском языке.' },
+      ]
+    } else if (types.includes('doc') && attachmentFields.doc_url) {
+      const mimeMap = {
+        pdf:  'application/pdf',
+        doc:  'application/msword',
+        docx: 'application/msword',
+        txt:  'text/plain',
+      }
+      const mime   = mimeMap[attachmentFields.doc_ext?.toLowerCase()] ?? 'application/octet-stream'
+      const docRes = await fetch(attachmentFields.doc_url)
+      const docBuf = await docRes.arrayBuffer()
+      const base64 = Buffer.from(docBuf).toString('base64')
+      parts = [
+        { inline_data: { mime_type: mime, data: base64 } },
+        { text: 'Опиши содержимое этого документа. Отвечай на русском языке.' },
+      ]
+    } else {
+      // audio-музыка или неизвестный тип — транскрибация не нужна
+      return empty
     }
 
-    // аудио-сообщение
-    let audioOwnerId = null;
-    let audioId = null;
-    let audioAccessKey = null;
-    let audioDuration = null;
-    let audioLinkMp3 = null;
-    let audioLinkOgg = null;
+    const geminiRes = await fetch(GEMINI_URL, {
+      method:  'POST',
+      agent:   proxyAgent,
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ contents: [{ parts }] }),
+    })
 
-    const audioAttachment = attachments.find(
-      (a) => a.type === "audio_message"
-    );
-    if (audioAttachment && audioAttachment.audio_message) {
-      const a = audioAttachment.audio_message;
-      audioOwnerId = a.owner_id ?? null;
-      audioId = a.id ?? null;
-      audioAccessKey = a.access_key ?? null;
-      audioDuration = a.duration ?? null;
-      audioLinkMp3 = a.link_mp3 ?? null;
-      audioLinkOgg = a.link_ogg ?? null;
+    const geminiJson = await geminiRes.json()
+
+    if (!geminiRes.ok) {
+      console.error('[transcribeAttachment] Gemini error:', JSON.stringify(geminiJson))
+      return empty
     }
 
-    const hasAttachments = attachments.length > 0;
+    const transcription      = geminiJson.candidates?.[0]?.content?.parts?.[0]?.text ?? null
+    const gemini_response_id = geminiJson.responseId ?? null
+    const usageMetadata      = geminiJson.usageMetadata ?? null
 
-    // формируем запись для таблицы message
-    const row = {
-      vk_message_id: vkMessageId,
-      conversation_message_id: convMsgId,
+    return { transcription, gemini_response_id, usageMetadata }
+
+  } catch (err) {
+    console.error('[transcribeAttachment] failed:', err.message)
+    return empty
+  }
+}
+
+// ── 6. saveTokenUsage ────────────────────────────────────────────────────────
+
+async function saveTokenUsage(usageMetadata, responseId, dialogId, vkUserId) {
+  try {
+    const { error } = await supabase
+      .from('token_usage')
+      .insert({
+        prompt_tokens:     usageMetadata.promptTokenCount,
+        candidates_tokens: usageMetadata.candidatesTokenCount,
+        thoughts_tokens:   usageMetadata.thoughtsTokenCount ?? 0,
+        total_tokens:      usageMetadata.totalTokenCount,
+        model_version:     'gemini-2.5-flash',
+        response_id:       responseId,
+        dialog_id:         dialogId,
+        vk_user_id:        vkUserId,
+      })
+
+    if (error) console.error('[saveTokenUsage] insert error:', error.message)
+  } catch (err) {
+    console.error('[saveTokenUsage] failed:', err.message)
+  }
+}
+
+// ── 7. saveMessageFromVk ─────────────────────────────────────────────────────
+
+async function saveMessageFromVk(body) {
+  // 1. Достаём message
+  const msg = body?.object?.message
+  if (!msg) throw new Error('No message object in body')
+
+  // 2. Поля
+  const {
+    id:                      vk_message_id,
+    conversation_message_id,
+    from_id,
+    peer_id,
+    date,
+    text,
+    attachments = [],
+  } = msg
+
+  const event_id   = body.event_id ?? null
+  const group_id   = body.group_id ?? null
+  const vk_version = body.v        ?? null
+
+  // 3. Пользователь
+  await ensureUserExists(from_id)
+
+  // 4. Диалог
+  const dialog   = await ensureDialogExists(from_id, peer_id)
+  const dialogId = dialog.id
+
+  // 5. Вложения
+  const attachmentFields = parseAttachments(attachments)
+
+  // 6. Транскрибация
+  const { transcription, gemini_response_id, usageMetadata } =
+    await transcribeAttachment(attachmentFields, attachmentFields.attachment_types)
+
+  // 7. Токены
+  if (gemini_response_id && usageMetadata) {
+    await saveTokenUsage(usageMetadata, gemini_response_id, dialogId, from_id)
+  }
+
+  // 8. INSERT message
+  const { data: savedMessage, error: msgErr } = await supabase
+    .from('message')
+    .insert({
+      vk_message_id,
+      conversation_message_id,
       event_id,
       group_id,
-      vk_version: v,
-
-      from_id: fromId,
-      peer_id: peerId,
-      msg_date: msgDate,
-
+      vk_version,
+      from_id,
+      peer_id,
+      msg_date:          date,
       text,
-      has_attachments: hasAttachments,
-      attachment_types: attachmentTypes || null,
+      has_attachments:   attachmentFields.has_attachments,
+      attachment_types:  attachmentFields.attachment_types,
+      // photo
+      photo_owner_id:    attachmentFields.photo_owner_id,
+      photo_id:          attachmentFields.photo_id,
+      photo_access_key:  attachmentFields.photo_access_key,
+      photo_url:         attachmentFields.photo_url,
+      photo_width:       attachmentFields.photo_width,
+      photo_height:      attachmentFields.photo_height,
+      // audio
+      audio_owner_id:    attachmentFields.audio_owner_id,
+      audio_id:          attachmentFields.audio_id,
+      audio_access_key:  attachmentFields.audio_access_key,
+      audio_duration:    attachmentFields.audio_duration,
+      audio_link_mp3:    attachmentFields.audio_link_mp3,
+      audio_link_ogg:    attachmentFields.audio_link_ogg,
+      // doc
+            doc_owner_id:      attachmentFields.doc_owner_id,
+      doc_id:            attachmentFields.doc_id,
+      doc_access_key:    attachmentFields.doc_access_key,
+      doc_url:           attachmentFields.doc_url,
+      doc_title:         attachmentFields.doc_title,
+      doc_ext:           attachmentFields.doc_ext,
+      // voice
+      voice_owner_id:    attachmentFields.voice_owner_id,
+      voice_id:          attachmentFields.voice_id,
+      voice_access_key:  attachmentFields.voice_access_key,
+      voice_duration:    attachmentFields.voice_duration,
+      voice_link_ogg:    attachmentFields.voice_link_ogg,
+      // мета
+      direction:         'in',
+      dialog_id:         dialogId,
+      is_transcribed:    transcription !== null,
+      transcription,
+      gemini_response_id,
+      raw_json:          body,
+    })
+    .select()
+    .single()
 
-      photo_owner_id: photoOwnerId,
-      photo_id: photoId,
-      photo_access_key: photoAccessKey,
-      photo_url: photoUrl,
-      photo_width: photoWidth,
-      photo_height: photoHeight,
+  if (msgErr) throw msgErr
 
-      audio_owner_id: audioOwnerId,
-      audio_id: audioId,
-      audio_access_key: audioAccessKey,
-      audio_duration: audioDuration,
-      audio_link_mp3: audioLinkMp3,
-      audio_link_ogg: audioLinkOgg,
+  // 9. UPDATE dialog — счётчик и время последнего сообщения
+  const { error: dlgErr } = await supabase
+    .rpc('increment_message_count', { dialog_id: dialogId })
 
-      raw_json: body,
-    };
+  if (dlgErr) console.error('[saveMessageFromVk] dialog update error:', dlgErr.message)
 
-    console.log("NORMALIZED MESSAGE ROW:", row);
+  // 10. Возвращаем сохранённое сообщение
+  return savedMessage
+}
 
-    if (supabase) {
-      const { data, error } = await supabase
-        .from("message")
-        .insert([row]); // [row] — вставка одной записи
+// ── 8. Handler (export default) ─────────────────────────────────────────────
 
-      if (error) {
-        console.error("Supabase insert error:", error);
-      } else {
-        console.log("Supabase insert ok, id(s):", data?.map((d) => d.id));
-      }
-    } else {
-      console.warn("Supabase client not initialized, row not saved");
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' })
+  }
+
+  const body = req.body
+
+  // Проверка секрета
+  if (body.secret !== process.env.VK_CALLBACK_SECRET) {
+    return res.status(403).json({ error: 'Invalid secret' })
+  }
+
+  // Подтверждение сервера
+  if (body.type === 'confirmation') {
+    return res.status(200).send(process.env.VK_CONFIRMATION_CODE)
+  }
+
+  // Входящее сообщение
+  if (body.type === 'message_new') {
+    try {
+      await saveMessageFromVk(body)
+    } catch (err) {
+      console.error('[handler] saveMessageFromVk failed:', err.message)
+      // Возвращаем ok даже при ошибке — иначе VK будет ретранслировать
     }
   }
 
-  res.status(200).setHeader("Content-Type", "text/plain; charset=utf-8");
-  return res.send("ok");
+  return res.status(200).send('ok')
 }
+      
