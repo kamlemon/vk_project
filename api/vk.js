@@ -459,11 +459,14 @@ export default async function handler(req, res) {
 
       const endpoint = isNewUser ? 'new-user' : 'old-user'
 
-      fetch(`${baseUrl}/api/${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_id: vk_user_id, text }),
-      }).catch((err) => console.error(`[handler] fetch /${endpoint} error:`, err.message))
+      // Импортируем и вызываем напрямую
+      if (endpoint === 'new-user') {
+        import('../api/new-user.js').then(m => {
+          const fakeReq = { method: 'POST', body: { user_id: vk_user_id, text } }
+          const fakeRes = { status: () => ({ end: () => {}, send: () => {} }), send: () => {} }
+          m.default(fakeReq, fakeRes).catch(e => console.error('[handler] new-user error:', e.message))
+        })
+      }
     }
   }
 
