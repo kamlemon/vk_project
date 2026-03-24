@@ -8,7 +8,7 @@ export default async function handler(req, res) {
 
   res.status(200).send('ok')
 
-  const { user_id, text } = req.body
+  const { user_id, text, first_name, sex } = req.body
   if (!user_id || !text) return
 
   try {
@@ -27,7 +27,10 @@ export default async function handler(req, res) {
     if (!docRow) await log('new-user', 'system_prompt не найден, идём без него', null, 'warn')
     else await log('new-user', 'system_prompt загружен', { length: docRow.content.length })
 
-    const { reply, inputTokens, outputTokens } = await callGemini(docRow?.content ?? null, text)
+    const sexLabel = sex === 1 ? 'женщина' : sex === 2 ? 'мужчина' : 'неизвестно'
+    const userContext = first_name ? `Имя клиента: ${first_name}. Пол: ${sexLabel}.` : ''
+    const userMessage = userContext ? `${userContext}\n\n${text}` : text
+    const { reply, inputTokens, outputTokens } = await callGemini(docRow?.content ?? null, userMessage)
 
     await log('new-user', 'Gemini ответил', { reply, inputTokens, outputTokens })
 

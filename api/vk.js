@@ -463,7 +463,7 @@ export default async function handler(req, res) {
       if (endpoint === 'new-user') {
         try {
           const m = await import('../api/new-user.js')
-          const fakeReq = { method: 'POST', body: { user_id: vk_user_id, text } }
+          const fakeReq = { method: 'POST', body: { user_id: vk_user_id, text, first_name: existingUser?.first_name || null, sex: existingUser?.sex || null } }
           const fakeRes = { status: () => ({ end: () => {}, send: () => {} }), send: () => {} }
           await m.default(fakeReq, fakeRes)
         } catch(e) {
