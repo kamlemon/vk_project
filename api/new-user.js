@@ -32,7 +32,7 @@ export default async function handler(req, res) {
     const userMessage = userContext ? `${userContext}\n\n${text}` : text
     const { reply, inputTokens, outputTokens, model: usedModel } = await callDeepSeek(docRow?.content ?? null, userMessage)
 
-    await log('new-user', 'Gemini ответил', { reply, inputTokens, outputTokens, model: usedModel })
+    await log('new-user', 'DeepSeek ответил', { reply, inputTokens, outputTokens, model: usedModel })
 
     // Получаем dialog_id
     const { data: dialog } = await supabase
