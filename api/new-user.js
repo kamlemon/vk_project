@@ -30,7 +30,7 @@ export default async function handler(req, res) {
     const sexLabel = sex === 1 ? 'женщина' : sex === 2 ? 'мужчина' : 'неизвестно'
     const userContext = first_name ? `Имя клиента: ${first_name}. Пол: ${sexLabel}.` : ''
     const userMessage = userContext ? `${userContext}\n\n${text}` : text
-    const { reply, inputTokens, outputTokens, model: usedModel } = await callDeepSeek(docRow?.content ?? null, userMessage)
+    const { reply, inputTokens, outputTokens, model: usedModel } = await callDeepSeek(docRow?.content ?? null, '', [], userMessage)
 
     await log('new-user', 'DeepSeek ответил', { reply, inputTokens, outputTokens, model: usedModel })
 
