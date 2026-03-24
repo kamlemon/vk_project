@@ -1,29 +1,24 @@
-import { supabase } from '../lib/supabase.js';
-import { callGemini } from '../lib/gemini.js';
-import { sendMessage } from '../lib/vk.js';
+import { supabase } from '../lib/supabase.js'
+import { callGemini } from '../lib/gemini.js'
+import { sendMessage } from '../lib/vk.js'
+import { log } from '../lib/logger.js'
 
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).end();
+  if (req.method !== 'POST') return res.status(405).end()
 
-  res.status(200).send('ok');
+  res.status(200).send('ok')
 
-  const { user_id, text } = req.body;
-
-  if (!user_id || !text) {
-    console.error('[new-user] Missing user_id or text');
-    return;
-  }
+  const { user_id, text } = req.body
+  if (!user_id || !text) return
 
   try {
-    const { error: insertUserError } = await supabase
-      .from('user')
-      .insert({ user_id, is_paid: false, consultation_done: false })
-      .onConflict('user_id')
-      .ignore();
+    await log('new-user', 'Начало обработки нового юзера', { user_id, text })
 
-    if (insertUserError) {
-      console.error('[new-user] insertUser error:', insertUserError.message);
-    }
+    await supabase.from('user')
+      .insert({ vk_user_id: user_id, is_paid: false, consultation_done: false })
+      .onConflict('vk_user_id').ignore()
+
+    await log('new-user', 'Юзер создан или уже существует', { user_id })
 
     const { data: docRow } = await supabase
       .from('document')
@@ -31,35 +26,26 @@ export default async function handler(req, res) {
       .eq('type', 'system_prompt')
       .order('created_at', { ascending: false })
       .limit(1)
-      .maybeSingle();
+      .maybeSingle()
 
-    if (!docRow) {
-      console.warn('[new-user] No system_prompt document found — Gemini without system prompt');
-    }
+    if (!docRow) await log('new-user', 'system_prompt не найден, идём без него', null, 'warn')
+    else await log('new-user', 'system_prompt загружен', { length: docRow.content.length })
 
-    const systemPrompt = docRow?.content ?? null;
+    const { reply, inputTokens, outputTokens } = await callGemini(docRow?.content ?? null, text)
 
-    const { reply, inputTokens, outputTokens } = await callGemini(systemPrompt, text);
+    await log('new-user', 'Gemini ответил', { reply, inputTokens, outputTokens })
 
-    const { error: insertReplyError } = await supabase
-      .from('message')
-      .insert({ user_id, role: 'assistant', content: reply });
+    await supabase.from('message')
+      .insert({ user_id, role: 'assistant', content: reply })
 
-    if (insertReplyError) {
-      console.error('[new-user] insertReply error:', insertReplyError.message);
-    }
+    await supabase.from('token_usage')
+      .insert({ user_id, input_tokens: inputTokens, output_tokens: outputTokens })
 
-    const { error: insertTokensError } = await supabase
-      .from('token_usage')
-      .insert({ user_id, input_tokens: inputTokens, output_tokens: outputTokens });
+    await sendMessage(user_id, reply)
 
-    if (insertTokensError) {
-      console.error('[new-user] insertTokens error:', insertTokensError.message);
-    }
-
-    await sendMessage(user_id, reply);
+    await log('new-user', 'Ответ отправлен в VK', { user_id })
 
   } catch (err) {
-    console.error('[new-user] Unhandled error:', err.message);
+    await log('new-user', 'ОШИБКА', { error: err.message }, 'error')
   }
 }
