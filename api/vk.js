@@ -461,11 +461,14 @@ export default async function handler(req, res) {
 
       // Импортируем и вызываем напрямую
       if (endpoint === 'new-user') {
-        import('../api/new-user.js').then(m => {
+        try {
+          const m = await import('../api/new-user.js')
           const fakeReq = { method: 'POST', body: { user_id: vk_user_id, text } }
           const fakeRes = { status: () => ({ end: () => {}, send: () => {} }), send: () => {} }
-          m.default(fakeReq, fakeRes).catch(e => console.error('[handler] new-user error:', e.message))
-        })
+          await m.default(fakeReq, fakeRes)
+        } catch(e) {
+          console.error('[handler] new-user error:', e.message)
+        }
       }
     }
   }
