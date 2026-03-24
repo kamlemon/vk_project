@@ -14,7 +14,7 @@ export default async function handler(req, res) {
   try {
     await log('new-user', 'Начало обработки нового юзера', { user_id, text })
 
-    await log('new-user', 'Юзер уже создан в vk.js', { user_id })
+    await log('new-user', 'Юзер уже создан в vk.js', { user_id, first_name, sex })
 
     const { data: docRow } = await supabase
       .from('document')
