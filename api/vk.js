@@ -323,6 +323,19 @@ async function saveMessageFromVk(body) {
   } = msg
 
   const event_id   = body.event_id ?? null
+
+  // Дедупликация — если event_id уже обрабатывали, игнорируем
+  if (event_id) {
+    const { data: existing } = await supabase
+      .from('message')
+      .select('id')
+      .eq('event_id', event_id)
+      .maybeSingle()
+    if (existing) {
+      console.log('[vk] дубликат event_id, пропускаем:', event_id)
+      return res.status(200).send('ok')
+    }
+  }
   const group_id   = body.group_id ?? null
   const vk_version = body.v        ?? null
 
