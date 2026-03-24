@@ -1,5 +1,5 @@
 import { supabase } from '../lib/supabase.js'
-import { callGemini } from '../lib/gemini.js'
+import { callDeepSeek } from '../lib/deepseek.js'
 import { sendMessage } from '../lib/vk.js'
 import { log } from '../lib/logger.js'
 
@@ -30,7 +30,7 @@ export default async function handler(req, res) {
     const sexLabel = sex === 1 ? 'женщина' : sex === 2 ? 'мужчина' : 'неизвестно'
     const userContext = first_name ? `Имя клиента: ${first_name}. Пол: ${sexLabel}.` : ''
     const userMessage = userContext ? `${userContext}\n\n${text}` : text
-    const { reply, inputTokens, outputTokens, model: usedModel } = await callGemini(docRow?.content ?? null, userMessage)
+    const { reply, inputTokens, outputTokens, model: usedModel } = await callDeepSeek(docRow?.content ?? null, userMessage)
 
     await log('new-user', 'Gemini ответил', { reply, inputTokens, outputTokens, model: usedModel })
 
