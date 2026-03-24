@@ -30,9 +30,9 @@ export default async function handler(req, res) {
     const sexLabel = sex === 1 ? 'женщина' : sex === 2 ? 'мужчина' : 'неизвестно'
     const userContext = first_name ? `Имя клиента: ${first_name}. Пол: ${sexLabel}.` : ''
     const userMessage = userContext ? `${userContext}\n\n${text}` : text
-    const { reply, inputTokens, outputTokens } = await callGemini(docRow?.content ?? null, userMessage)
+    const { reply, inputTokens, outputTokens, model: usedModel } = await callGemini(docRow?.content ?? null, userMessage)
 
-    await log('new-user', 'Gemini ответил', { reply, inputTokens, outputTokens })
+    await log('new-user', 'Gemini ответил', { reply, inputTokens, outputTokens, model: usedModel })
 
     await supabase.from('message')
       .insert({ user_id, role: 'assistant', content: reply })
