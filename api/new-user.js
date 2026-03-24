@@ -14,11 +14,7 @@ export default async function handler(req, res) {
   try {
     await log('new-user', 'Начало обработки нового юзера', { user_id, text })
 
-    await supabase.from('user')
-      .insert({ vk_user_id: user_id, is_paid: false, consultation_done: false })
-      .onConflict('vk_user_id').ignore()
-
-    await log('new-user', 'Юзер создан или уже существует', { user_id })
+    await log('new-user', 'Юзер уже создан в vk.js', { user_id })
 
     const { data: docRow } = await supabase
       .from('document')
