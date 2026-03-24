@@ -431,11 +431,37 @@ export default async function handler(req, res) {
 
   // Входящее сообщение
   if (body.type === 'message_new') {
+    const msg = body?.object?.message
+    const vk_user_id = msg?.from_id
+
+    // Запоминаем флаг ДО того как ensureUserExists создаст запись
+    const { data: existingUser } = await supabase
+      .from('user')
+      .select('vk_user_id')
+      .eq('vk_user_id', vk_user_id)
+      .maybeSingle()
+
+    const isNewUser = !existingUser
+
     try {
       await saveMessageFromVk(body)
     } catch (err) {
       console.error('[handler] saveMessageFromVk failed:', err.message)
-      // Возвращаем ok даже при ошибке — иначе VK будет ретранслировать
+    }
+
+    if (msg) {
+      const text = msg.text ?? ''
+      const baseUrl = process.env.VERCEL_URL
+        ? `https://${process.env.VERCEL_URL}`
+        : 'http://localhost:3000'
+
+      const endpoint = isNewUser ? 'new-user' : 'old-user'
+
+      fetch(`${baseUrl}/api/${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: vk_user_id, text }),
+      }).catch((err) => console.error(`[handler] fetch /${endpoint} error:`, err.message))
     }
   }
 
