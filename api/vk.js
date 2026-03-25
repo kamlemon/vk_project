@@ -1,17 +1,8 @@
-import { createClient } from '@supabase/supabase-js'
-import { HttpsProxyAgent } from 'https-proxy-agent'
+import { supabase } from '../lib/supabase.js'
+import { callGemini } from '../lib/gemini.js'
+
 
 // ── Инициализация ────────────────────────────────────────────────────────────
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-)
-
-const proxyAgent = new HttpsProxyAgent(process.env.PROXY_URL)
-
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY
-const GEMINI_URL     = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`
 
 // ── 1. fetchVkUser ───────────────────────────────────────────────────────────
 
