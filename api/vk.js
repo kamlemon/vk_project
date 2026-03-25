@@ -308,38 +308,48 @@ export default async function handler(req, res) {
     }
 
     if (msg) {
-      const text    = msg.text ?? ''
+      const text = msg.text ?? ''
       const { data: userRow } = await supabase
         .from('user')
         .select('first_name, sex')
         .eq('vk_user_id', vk_user_id)
         .maybeSingle()
 
+      // Берём id последнего входящего сообщения для reply_to_id
+      const { data: lastMsg } = await supabase
+        .from('message')
+        .select('id')
+        .eq('dialog_id', (await supabase
+          .from('dialog')
+          .select('id')
+          .eq('vk_user_id', vk_user_id)
+          .not('status_id', 'is', null)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle()
+        ).data?.id)
+        .eq('direction', 'in')
+        .order('dt_create', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+
       const fakeReq = {
         method: 'POST',
         body: {
-          user_id:    vk_user_id,
+          user_id:             vk_user_id,
           text,
-          first_name: userRow?.first_name ?? null,
-          sex:        userRow?.sex ?? null,
+          first_name:          userRow?.first_name ?? null,
+          sex:                 userRow?.sex ?? null,
+          incoming_message_id: lastMsg?.id ?? null,
         },
       }
       const fakeRes = { status: () => ({ end: () => {}, send: () => {} }), send: () => {} }
 
-      if (isNewUser) {
-        try {
-          const m = await import('../api/new-user.js')
-          await m.default(fakeReq, fakeRes)
-        } catch (e) {
-          console.error('[handler] new-user error:', e.message)
-        }
-      } else {
-        try {
-          const m = await import('../api/old-user.js')
-          await m.default(fakeReq, fakeRes)
-        } catch (e) {
-          console.error('[handler] old-user error:', e.message)
-        }
+      try {
+        const m = await import('../api/router.js')
+        await m.default(fakeReq, fakeRes)
+      } catch (e) {
+        console.error('[handler] router error:', e.message)
       }
     }
   }
