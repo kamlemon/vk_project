@@ -14,7 +14,6 @@ export default async function handler(req, res) {
   try {
     await log('old-user', 'Начало обработки повторного юзера', { user_id, text })
 
-    // Загружаем промпт для воронки, fallback на system_prompt
     const { data: docRow } = await supabase
       .from('document')
       .select('content')
@@ -35,16 +34,13 @@ export default async function handler(req, res) {
         .limit(1)
         .maybeSingle()
       prompt = fallback?.content ?? null
-    } else {
-      await log('old-user', 'system_prompt_funnel загружен', { length: docRow.content.length })
     }
 
-    // Получаем историю диалога (последние 10 сообщений)
     const { data: dialog } = await supabase
       .from('dialog')
-      .select('id')
+      .select('id, message_count')
       .eq('vk_user_id', user_id)
-      .eq('status', 'active')
+      .eq('status_id', 1)
       .maybeSingle()
 
     const dialog_id = dialog?.id ?? null
@@ -55,12 +51,12 @@ export default async function handler(req, res) {
         .from('message')
         .select('text, direction')
         .eq('dialog_id', dialog_id)
-        .order('created_at', { ascending: false })
+        .order('dt_create', { ascending: false })
         .limit(10)
 
       if (messages) {
         history = messages.reverse().map(m => ({
-          role: m.direction === 'out' ? 'assistant' : 'user',
+          role:    m.direction === 'out' ? 'assistant' : 'user',
           content: m.text,
         }))
       }
@@ -68,38 +64,43 @@ export default async function handler(req, res) {
 
     await log('old-user', 'История загружена', { count: history.length })
 
-    const sexLabel = sex === 1 ? 'женщина' : sex === 2 ? 'мужчина' : 'неизвестно'
+    const sexLabel    = sex === 1 ? 'женщина' : sex === 2 ? 'мужчина' : 'неизвестно'
     const userContext = first_name ? `Имя клиента: ${first_name}. Пол: ${sexLabel}.` : ''
 
-    const { reply, inputTokens, outputTokens, model: usedModel } = await callDeepSeek(
-      prompt,
-      userContext,
-      history,
-      text
-    )
+    const { reply, inputTokens, outputTokens, model: usedModel } =
+      await callDeepSeek(prompt, userContext, history, text)
 
     await log('old-user', 'DeepSeek ответил', { reply, inputTokens, outputTokens, model: usedModel })
 
-    // Сохраняем ответ
     await supabase.from('message').insert({
-      from_id: user_id,
-      peer_id: user_id,
-      text: reply,
-      direction: 'out',
       dialog_id,
-      is_transcribed: false,
-      sent_at: new Date().toISOString(),
+      from_id:   user_id,
+      peer_id:   user_id,
+      direction: 'out',
+      text:      reply,
+      msg_date:  new Date().toISOString(),
+      raw_json:  { source: 'old-user', model: usedModel },
     })
 
-    // Сохраняем токены
     await supabase.from('token_usage').insert({
-      vk_user_id: user_id,
+      vk_user_id:        user_id,
       dialog_id,
-      prompt_tokens: inputTokens,
+      prompt_tokens:     inputTokens,
       candidates_tokens: outputTokens,
-      total_tokens: inputTokens + outputTokens,
-      model_version: usedModel,
+      total_tokens:      inputTokens + outputTokens,
+      model_version:     usedModel,
     })
+
+    if (dialog_id) {
+      await supabase
+        .from('dialog')
+        .update({
+          message_count:   (dialog.message_count ?? 0) + 1,
+          last_message_at: new Date().toISOString(),
+          last_message_by: 'bot',
+        })
+        .eq('id', dialog_id)
+    }
 
     await sendMessage(user_id, reply)
     await log('old-user', 'Ответ отправлен в VK', { user_id })

@@ -1,8 +1,5 @@
 import { supabase } from '../lib/supabase.js'
-import { callGemini } from '../lib/gemini.js'
-
-
-// ── Инициализация ────────────────────────────────────────────────────────────
+import { callGeminiMultimodal } from '../lib/gemini.js'
 
 // ── 1. fetchVkUser ───────────────────────────────────────────────────────────
 
@@ -53,11 +50,10 @@ async function ensureUserExists(vkUserId) {
   } catch (vkError) {
     console.error('[ensureUserExists] fetchVkUser failed:', vkError.message)
     userData = {
-      vk_user_id:   vkUserId,
-      first_name:   'Unknown',
-      last_name:    '',
-      funnel_stage: 'new',
-      raw_json:     { error: vkError.message },
+      vk_user_id: vkUserId,
+      first_name: 'Unknown',
+      last_name:  '',
+      raw_json:   { error: vkError.message },
     }
   }
 
@@ -78,7 +74,7 @@ async function ensureDialogExists(vkUserId, peerId) {
     .from('dialog')
     .select('*')
     .eq('vk_user_id', vkUserId)
-    .eq('status', 'active')
+    .eq('status_id', 1)
     .limit(1)
     .maybeSingle()
 
@@ -87,7 +83,7 @@ async function ensureDialogExists(vkUserId, peerId) {
 
   const { data: inserted, error: insErr } = await supabase
     .from('dialog')
-    .insert({ vk_user_id: vkUserId, peer_id: peerId, status: 'active' })
+    .insert({ vk_user_id: vkUserId, peer_id: peerId, status_id: 1 })
     .select()
     .single()
 
@@ -101,33 +97,12 @@ function parseAttachments(attachments) {
   const result = {
     has_attachments:  false,
     attachment_types: null,
-    // photo
-    photo_owner_id:   null,
-    photo_id:         null,
-    photo_access_key: null,
-    photo_url:        null,
-    photo_width:      null,
-    photo_height:     null,
-    // audio
-    audio_owner_id:   null,
-    audio_id:         null,
-    audio_access_key: null,
-    audio_duration:   null,
-    audio_link_mp3:   null,
-    audio_link_ogg:   null,
-    // doc
-    doc_owner_id:     null,
-    doc_id:           null,
-    doc_access_key:   null,
-    doc_url:          null,
-    doc_title:        null,
-    doc_ext:          null,
-    // voice (audio_message)
-    voice_owner_id:   null,
-    voice_id:         null,
-    voice_access_key: null,
-    voice_duration:   null,
-    voice_link_ogg:   null,
+    attachment_url:   [],
+    // для транскрибации — храним внутренне, в БД не пишем отдельными полями
+    _voice_ogg: null,
+    _photo_url: null,
+    _doc_url:   null,
+    _doc_ext:   null,
   }
 
   if (!attachments || attachments.length === 0) return result
@@ -138,58 +113,39 @@ function parseAttachments(attachments) {
 
   for (const att of attachments) {
     switch (att.type) {
-
       case 'photo': {
-        if (result.photo_id !== null) break
         const photo = att.photo
         const best  = (photo.sizes ?? []).reduce(
-          (max, s) => (s.width > (max?.width ?? 0) ? s : max),
-          null
+          (max, s) => (s.width > (max?.width ?? 0) ? s : max), null
         )
-        result.photo_owner_id   = photo.owner_id
-        result.photo_id         = photo.id
-        result.photo_access_key = photo.access_key ?? null
-        result.photo_url        = best?.url ?? null
-        result.photo_width      = best?.width ?? null
-        result.photo_height     = best?.height ?? null
+        if (best?.url) {
+          result.attachment_url.push(best.url)
+          result._photo_url = result._photo_url ?? best.url
+        }
         break
       }
-
-      case 'audio': {
-        if (result.audio_id !== null) break
-        const audio             = att.audio
-        result.audio_owner_id   = audio.owner_id
-        result.audio_id         = audio.id
-        result.audio_access_key = audio.access_key ?? null
-        result.audio_duration   = audio.duration ?? null
-        result.audio_link_mp3   = audio.url ?? null
-        result.audio_link_ogg   = audio.url_ogg ?? null
-        break
-      }
-
-      case 'doc': {
-        if (result.doc_id !== null) break
-        const doc             = att.doc
-        result.doc_owner_id   = doc.owner_id
-        result.doc_id         = doc.id
-        result.doc_access_key = doc.access_key ?? null
-        result.doc_url        = doc.url ?? null
-        result.doc_title      = doc.title ?? null
-        result.doc_ext        = doc.ext ?? null
-        break
-      }
-
       case 'audio_message': {
-        if (result.voice_id !== null) break
-        const vm                = att.audio_message
-        result.voice_owner_id   = vm.owner_id
-        result.voice_id         = vm.id
-        result.voice_access_key = vm.access_key ?? null
-        result.voice_duration   = vm.duration ?? null
-        result.voice_link_ogg   = vm.link_ogg ?? null
+        const vm = att.audio_message
+        if (vm.link_ogg) {
+          result.attachment_url.push(vm.link_ogg)
+          result._voice_ogg = result._voice_ogg ?? vm.link_ogg
+        }
         break
       }
-
+      case 'doc': {
+        const doc = att.doc
+        if (doc.url) {
+          result.attachment_url.push(doc.url)
+          result._doc_url = result._doc_url ?? doc.url
+          result._doc_ext = result._doc_ext ?? doc.ext
+        }
+        break
+      }
+      case 'audio': {
+        const audio = att.audio
+        if (audio.url) result.attachment_url.push(audio.url)
+        break
+      }
       default:
         break
     }
@@ -200,71 +156,47 @@ function parseAttachments(attachments) {
 
 // ── 5. transcribeAttachment ──────────────────────────────────────────────────
 
-async function transcribeAttachment(attachmentFields, attachmentTypes) {
-  const empty = { transcription: null, gemini_response_id: null, usageMetadata: null }
+async function transcribeAttachment(parsed) {
+  const empty = { transcriptions: null }
 
-  if (!attachmentTypes) return empty
+  if (!parsed.has_attachments) return empty
 
-  const types = attachmentTypes.split(',')
+  const types = parsed.attachment_types?.split(',') ?? []
 
   try {
     let parts = null
 
-    if (types.includes('audio_message') && attachmentFields.voice_link_ogg) {
-      const audioRes    = await fetch(attachmentFields.voice_link_ogg)
-      const audioBuffer = await audioRes.arrayBuffer()
-      const base64      = Buffer.from(audioBuffer).toString('base64')
+    if (types.includes('audio_message') && parsed._voice_ogg) {
+      const buf    = await (await fetch(parsed._voice_ogg)).arrayBuffer()
+      const base64 = Buffer.from(buf).toString('base64')
       parts = [
         { inline_data: { mime_type: 'audio/ogg', data: base64 } },
         { text: 'Транскрибируй это голосовое сообщение. Верни только текст, без пояснений.' },
       ]
-    } else if (types.includes('photo') && attachmentFields.photo_url) {
-      const imgRes    = await fetch(attachmentFields.photo_url)
-      const imgBuffer = await imgRes.arrayBuffer()
-      const base64    = Buffer.from(imgBuffer).toString('base64')
+    } else if (types.includes('photo') && parsed._photo_url) {
+      const buf    = await (await fetch(parsed._photo_url)).arrayBuffer()
+      const base64 = Buffer.from(buf).toString('base64')
       parts = [
         { inline_data: { mime_type: 'image/jpeg', data: base64 } },
         { text: 'Опиши детально что изображено на фото. Отвечай на русском языке.' },
       ]
-    } else if (types.includes('doc') && attachmentFields.doc_url) {
-      const mimeMap = {
-        pdf:  'application/pdf',
-        doc:  'application/msword',
-        docx: 'application/msword',
-        txt:  'text/plain',
-      }
-      const mime   = mimeMap[attachmentFields.doc_ext?.toLowerCase()] ?? 'application/octet-stream'
-      const docRes = await fetch(attachmentFields.doc_url)
-      const docBuf = await docRes.arrayBuffer()
-      const base64 = Buffer.from(docBuf).toString('base64')
+    } else if (types.includes('doc') && parsed._doc_url) {
+      const mimeMap = { pdf: 'application/pdf', doc: 'application/msword', docx: 'application/msword', txt: 'text/plain' }
+      const mime    = mimeMap[parsed._doc_ext?.toLowerCase()] ?? 'application/octet-stream'
+      const buf     = await (await fetch(parsed._doc_url)).arrayBuffer()
+      const base64  = Buffer.from(buf).toString('base64')
       parts = [
         { inline_data: { mime_type: mime, data: base64 } },
         { text: 'Опиши содержимое этого документа. Отвечай на русском языке.' },
       ]
     } else {
-      // audio-музыка или неизвестный тип — транскрибация не нужна
       return empty
     }
 
-    const geminiRes = await fetch(GEMINI_URL, {
-      method:  'POST',
-      agent:   proxyAgent,
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ contents: [{ parts }] }),
-    })
-
-    const geminiJson = await geminiRes.json()
-
-    if (!geminiRes.ok) {
-      console.error('[transcribeAttachment] Gemini error:', JSON.stringify(geminiJson))
-      return empty
+    const result = await callGeminiMultimodal(parts)
+    return {
+      transcriptions: result.text ? [result.text] : null,
     }
-
-    const transcription      = geminiJson.candidates?.[0]?.content?.parts?.[0]?.text ?? null
-    const gemini_response_id = geminiJson.responseId ?? null
-    const usageMetadata      = geminiJson.usageMetadata ?? null
-
-    return { transcription, gemini_response_id, usageMetadata }
 
   } catch (err) {
     console.error('[transcribeAttachment] failed:', err.message)
@@ -272,147 +204,74 @@ async function transcribeAttachment(attachmentFields, attachmentTypes) {
   }
 }
 
-// ── 6. saveTokenUsage ────────────────────────────────────────────────────────
-
-async function saveTokenUsage(usageMetadata, responseId, dialogId, vkUserId) {
-  try {
-    const { error } = await supabase
-      .from('token_usage')
-      .insert({
-        prompt_tokens:     usageMetadata.promptTokenCount,
-        candidates_tokens: usageMetadata.candidatesTokenCount,
-        thoughts_tokens:   usageMetadata.thoughtsTokenCount ?? 0,
-        total_tokens:      usageMetadata.totalTokenCount,
-        model_version:     'gemini-2.5-flash',
-        response_id:       responseId,
-        dialog_id:         dialogId,
-        vk_user_id:        vkUserId,
-      })
-
-    if (error) console.error('[saveTokenUsage] insert error:', error.message)
-  } catch (err) {
-    console.error('[saveTokenUsage] failed:', err.message)
-  }
-}
-
-// ── 7. saveMessageFromVk ─────────────────────────────────────────────────────
+// ── 6. saveMessageFromVk ─────────────────────────────────────────────────────
 
 async function saveMessageFromVk(body) {
-  // 1. Достаём message
   const msg = body?.object?.message
   if (!msg) throw new Error('No message object in body')
 
-  // 2. Поля
-  const {
-    id:                      vk_message_id,
-    conversation_message_id,
-    from_id,
-    peer_id,
-    date,
-    text,
-    attachments = [],
-  } = msg
+  const { id: vk_message_id, from_id, peer_id, date, text, attachments = [] } = msg
+  const event_id = body.event_id ?? null
+  const group_id = body.group_id ?? null
 
-  const event_id   = body.event_id ?? null
-
-  // Дедупликация — атомарный INSERT, если уже есть — пропускаем
+  // Дедупликация
   if (event_id) {
     const { error: dedupErr } = await supabase
       .from('processed_events')
       .insert({ event_id })
     if (dedupErr) {
       console.log('[vk] дубликат event_id, пропускаем:', event_id)
-      return res.status(200).send('ok')
+      return null
     }
   }
-  const group_id   = body.group_id ?? null
-  const vk_version = body.v        ?? null
 
-  // 3. Пользователь
+  // Пользователь и диалог
   await ensureUserExists(from_id)
-
-  // 4. Диалог
   const dialog   = await ensureDialogExists(from_id, peer_id)
   const dialogId = dialog.id
 
-  // 5. Вложения
-  const attachmentFields = parseAttachments(attachments)
+  // Вложения
+  const parsed         = parseAttachments(attachments)
+  const { transcriptions } = await transcribeAttachment(parsed)
 
-  // 6. Транскрибация
-  const { transcription, gemini_response_id, usageMetadata } =
-    await transcribeAttachment(attachmentFields, attachmentFields.attachment_types)
-
-  // 7. Токены
-  if (gemini_response_id && usageMetadata) {
-    await saveTokenUsage(usageMetadata, gemini_response_id, dialogId, from_id)
-  }
-
-  // 8. INSERT message
+  // INSERT message — только поля новой схемы
   const { data: savedMessage, error: msgErr } = await supabase
     .from('message')
     .insert({
+      dialog_id:        dialogId,
       vk_message_id,
-      conversation_message_id,
       event_id,
       group_id,
-      vk_version,
       from_id,
       peer_id,
-      msg_date:          date,
+      msg_date:         date ? new Date(date * 1000).toISOString() : null,
+      direction:        'in',
       text,
-      has_attachments:   attachmentFields.has_attachments,
-      attachment_types:  attachmentFields.attachment_types,
-      // photo
-      photo_owner_id:    attachmentFields.photo_owner_id,
-      photo_id:          attachmentFields.photo_id,
-      photo_access_key:  attachmentFields.photo_access_key,
-      photo_url:         attachmentFields.photo_url,
-      photo_width:       attachmentFields.photo_width,
-      photo_height:      attachmentFields.photo_height,
-      // audio
-      audio_owner_id:    attachmentFields.audio_owner_id,
-      audio_id:          attachmentFields.audio_id,
-      audio_access_key:  attachmentFields.audio_access_key,
-      audio_duration:    attachmentFields.audio_duration,
-      audio_link_mp3:    attachmentFields.audio_link_mp3,
-      audio_link_ogg:    attachmentFields.audio_link_ogg,
-      // doc
-            doc_owner_id:      attachmentFields.doc_owner_id,
-      doc_id:            attachmentFields.doc_id,
-      doc_access_key:    attachmentFields.doc_access_key,
-      doc_url:           attachmentFields.doc_url,
-      doc_title:         attachmentFields.doc_title,
-      doc_ext:           attachmentFields.doc_ext,
-      // voice
-      voice_owner_id:    attachmentFields.voice_owner_id,
-      voice_id:          attachmentFields.voice_id,
-      voice_access_key:  attachmentFields.voice_access_key,
-      voice_duration:    attachmentFields.voice_duration,
-      voice_link_ogg:    attachmentFields.voice_link_ogg,
-      // мета
-      direction:         'in',
-      dialog_id:         dialogId,
-      is_transcribed:    transcription !== null,
-      transcription,
-      gemini_response_id,
-      raw_json:          body,
+      has_attachments:  parsed.has_attachments,
+      attachment_types: parsed.attachment_types,
+      attachment_url:   parsed.attachment_url.length > 0 ? parsed.attachment_url : null,
+      attachment_trans: transcriptions,
+      raw_json:         body,
     })
     .select()
     .single()
 
   if (msgErr) throw msgErr
 
-  // 9. UPDATE dialog — счётчик и время последнего сообщения
-  const { error: dlgErr } = await supabase
-    .rpc('increment_message_count', { dialog_id: dialogId })
+  // Обновляем счётчик и last_message_by в dialog
+  await supabase
+    .from('dialog')
+    .update({
+      message_count:   (dialog.message_count ?? 0) + 1,
+      last_message_at: new Date().toISOString(),
+      last_message_by: 'user',
+    })
+    .eq('id', dialogId)
 
-  if (dlgErr) console.error('[saveMessageFromVk] dialog update error:', dlgErr.message)
-
-  // 10. Возвращаем сохранённое сообщение
   return savedMessage
 }
 
-// ── 8. Handler (export default) ─────────────────────────────────────────────
+// ── 7. Handler ───────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -421,22 +280,19 @@ export default async function handler(req, res) {
 
   const body = req.body
 
-  // Проверка секрета
   if (body.secret !== process.env.VK_CALLBACK_SECRET) {
     return res.status(403).json({ error: 'Invalid secret' })
   }
 
-  // Подтверждение сервера
   if (body.type === 'confirmation') {
     return res.status(200).send(process.env.VK_CONFIRMATION_CODE)
   }
 
-  // Входящее сообщение
   if (body.type === 'message_new') {
-    const msg = body?.object?.message
+    const msg        = body?.object?.message
     const vk_user_id = msg?.from_id
 
-    // Запоминаем флаг ДО того как ensureUserExists создаст запись
+    // Определяем новый ли юзер ДО saveMessageFromVk
     const { data: existingUser } = await supabase
       .from('user')
       .select('vk_user_id')
@@ -452,34 +308,36 @@ export default async function handler(req, res) {
     }
 
     if (msg) {
-      const text = msg.text ?? ''
-      const baseUrl = process.env.VERCEL_PROJECT_URL
-        ? `https://${process.env.VERCEL_PROJECT_URL}`
-        : process.env.VERCEL_URL
-        ? `https://${process.env.VERCEL_URL}`
-        : 'http://localhost:3000'
+      const text    = msg.text ?? ''
+      const { data: userRow } = await supabase
+        .from('user')
+        .select('first_name, sex')
+        .eq('vk_user_id', vk_user_id)
+        .maybeSingle()
 
-      const endpoint = isNewUser ? 'new-user' : 'old-user'
+      const fakeReq = {
+        method: 'POST',
+        body: {
+          user_id:    vk_user_id,
+          text,
+          first_name: userRow?.first_name ?? null,
+          sex:        userRow?.sex ?? null,
+        },
+      }
+      const fakeRes = { status: () => ({ end: () => {}, send: () => {} }), send: () => {} }
 
-      // Импортируем и вызываем напрямую
-      if (endpoint === 'new-user') {
+      if (isNewUser) {
         try {
           const m = await import('../api/new-user.js')
-          const { data: userRow } = await supabase.from('user').select('first_name, sex').eq('vk_user_id', vk_user_id).maybeSingle()
-          const fakeReq = { method: 'POST', body: { user_id: vk_user_id, text, first_name: userRow?.first_name || null, sex: userRow?.sex || null } }
-          const fakeRes = { status: () => ({ end: () => {}, send: () => {} }), send: () => {} }
           await m.default(fakeReq, fakeRes)
-        } catch(e) {
+        } catch (e) {
           console.error('[handler] new-user error:', e.message)
         }
       } else {
         try {
           const m = await import('../api/old-user.js')
-          const { data: userRow } = await supabase.from('user').select('first_name, sex').eq('vk_user_id', vk_user_id).maybeSingle()
-          const fakeReq = { method: 'POST', body: { user_id: vk_user_id, text, first_name: userRow?.first_name || null, sex: userRow?.sex || null } }
-          const fakeRes = { status: () => ({ end: () => {}, send: () => {} }), send: () => {} }
           await m.default(fakeReq, fakeRes)
-        } catch(e) {
+        } catch (e) {
           console.error('[handler] old-user error:', e.message)
         }
       }
@@ -488,4 +346,3 @@ export default async function handler(req, res) {
 
   return res.status(200).send('ok')
 }
-      
