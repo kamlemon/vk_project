@@ -100,6 +100,23 @@ async function markReplied(messageId) {
     .eq('id', messageId)
 }
 
+async function isAlreadyReplied(messageId) {
+  if (!messageId) return false
+
+  const { data, error } = await supabase
+    .from('message')
+    .select('is_replied')
+    .eq('id', messageId)
+    .maybeSingle()
+
+  if (error) {
+    await log('router', 'Ошибка проверки is_replied', { error: error.message, messageId }, 'error')
+    return false
+  }
+
+  return Boolean(data?.is_replied)
+}
+
 // ── Вызов DeepSeek с логированием ввода/вывода ───────────────────────────────
 
 async function callLLM({ prompt, userContext, history, text, source }) {
@@ -341,6 +358,11 @@ export default async function handler(req, res) {
         await log('router', 'Дубликат event_id — пропускаем', { event_id: incomingEventId })
         return
       }
+    }
+
+    if (incoming_message_id && await isAlreadyReplied(incoming_message_id)) {
+      await log('router', 'Сообщение уже обработано — пропускаем', { incoming_message_id })
+      return
     }
 
     await log('router', 'Входящее сообщение', { user_id, text })

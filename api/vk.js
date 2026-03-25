@@ -74,7 +74,8 @@ async function ensureDialogExists(vkUserId, peerId) {
     .from('dialog')
     .select('*')
     .eq('vk_user_id', vkUserId)
-    .eq('status_id', 1)
+    .not('status_id', 'is', null)
+    .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle()
 
@@ -292,65 +293,42 @@ export default async function handler(req, res) {
     const msg        = body?.object?.message
     const vk_user_id = msg?.from_id
 
-    // Определяем новый ли юзер ДО saveMessageFromVk
-    const { data: existingUser } = await supabase
-      .from('user')
-      .select('vk_user_id')
-      .eq('vk_user_id', vk_user_id)
-      .maybeSingle()
-
-    const isNewUser = !existingUser
+    let savedMessage = null
 
     try {
-      await saveMessageFromVk(body)
+      savedMessage = await saveMessageFromVk(body)
     } catch (err) {
       console.error('[handler] saveMessageFromVk failed:', err.message)
     }
 
-    if (msg) {
-      const text = msg.text ?? ''
-      const { data: userRow } = await supabase
-        .from('user')
-        .select('first_name, sex')
-        .eq('vk_user_id', vk_user_id)
-        .maybeSingle()
+    if (!msg || !savedMessage) {
+      return res.status(200).send('ok')
+    }
 
-      // Берём id последнего входящего сообщения для reply_to_id
-      const { data: lastMsg } = await supabase
-        .from('message')
-        .select('id')
-        .eq('dialog_id', (await supabase
-          .from('dialog')
-          .select('id')
-          .eq('vk_user_id', vk_user_id)
-          .not('status_id', 'is', null)
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle()
-        ).data?.id)
-        .eq('direction', 'in')
-        .order('dt_create', { ascending: false })
-        .limit(1)
-        .maybeSingle()
+    const text = msg.text ?? ''
+    const { data: userRow } = await supabase
+      .from('user')
+      .select('first_name, sex')
+      .eq('vk_user_id', vk_user_id)
+      .maybeSingle()
 
-      const fakeReq = {
-        method: 'POST',
-        body: {
-          user_id:             vk_user_id,
-          text,
-          first_name:          userRow?.first_name ?? null,
-          sex:                 userRow?.sex ?? null,
-          incoming_message_id: lastMsg?.id ?? null,
-        },
-      }
-      const fakeRes = { status: () => ({ end: () => {}, send: () => {} }), send: () => {} }
+    const fakeReq = {
+      method: 'POST',
+      body: {
+        user_id:             vk_user_id,
+        text,
+        first_name:          userRow?.first_name ?? null,
+        sex:                 userRow?.sex ?? null,
+        incoming_message_id: savedMessage.id,
+      },
+    }
+    const fakeRes = { status: () => ({ end: () => {}, send: () => {} }), send: () => {} }
 
-      try {
-        const m = await import('../api/router.js')
-        await m.default(fakeReq, fakeRes)
-      } catch (e) {
-        console.error('[handler] router error:', e.message)
-      }
+    try {
+      const m = await import('../api/router.js')
+      await m.default(fakeReq, fakeRes)
+    } catch (e) {
+      console.error('[handler] router error:', e.message)
     }
   }
 
