@@ -331,6 +331,18 @@ export default async function handler(req, res) {
   if (!user_id) return
 
   try {
+    // Дедупликация на уровне роутера
+    const incomingEventId = req.body?.event_id ?? null
+    if (incomingEventId) {
+      const { error: dedupErr } = await supabase
+        .from('processed_events')
+        .insert({ event_id: incomingEventId })
+      if (dedupErr) {
+        await log('router', 'Дубликат event_id — пропускаем', { event_id: incomingEventId })
+        return
+      }
+    }
+
     await log('router', 'Входящее сообщение', { user_id, text })
 
     const dialog = await getDialog(user_id)
