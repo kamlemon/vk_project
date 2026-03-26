@@ -2,6 +2,7 @@ import { supabase } from '../lib/supabase.js'
 import { callDeepSeek } from '../lib/deepseek.js'
 import { sendMessage } from '../lib/vk.js'
 import { log } from '../lib/logger.js'
+import { trace } from '../lib/debug-trace.js'
 
 const DIAGNOSIS_MARKER = '[ДИАГНОСТИКА_ВЫПОЛНЕНА]'
 
@@ -98,6 +99,84 @@ async function markReplied(messageId) {
     .from('message')
     .update({ is_replied: true })
     .eq('id', messageId)
+}
+
+
+async function getIncomingMessage(messageId) {
+  if (!messageId) return null
+
+  const { data, error } = await supabase
+    .from('message')
+    .select('*')
+    .eq('id', messageId)
+    .maybeSingle()
+
+  if (error) {
+    await log('router', 'Ошибка загрузки incoming message', { error: error.message, messageId }, 'error')
+    return null
+  }
+
+  return data
+}
+
+function buildLLMUserText(text, incomingMessage) {
+  const trans = Array.isArray(incomingMessage?.attachment_trans)
+    ? incomingMessage.attachment_trans.join('\n\n')
+    : (incomingMessage?.attachment_trans ?? '')
+
+  return [
+    'Системные данные:',
+    `has_attachment: ${Boolean(incomingMessage?.has_attachments)}`,
+    `attachment_types: ${incomingMessage?.attachment_types ?? ''}`,
+    `has_attachment_trans: ${Boolean(trans)}`,
+    '',
+    'Правило: если пользователь просит анализ по фото ладони, но описание вложения отсутствует, не выдумывай анализ и вежливо попроси прислать фото ладони.',
+    'Если пользователь дал дату рождения текстом, можно делать анализ по дате рождения.',
+    '',
+    'Текст пользователя:',
+    text ?? '',
+    '',
+    trans ? `Описание вложения от системы:\n${trans}` : 'Описание вложения от системы: отсутствует',
+  ].join('\n')
+}
+
+async function handleDebugPreview({ dialog, userId, text, userContext, incomingMessageId, traceId }) {
+  const incomingMessage = await getIncomingMessage(incomingMessageId)
+
+  await trace(traceId, 'router.incoming_message_loaded', incomingMessage)
+
+  let promptId = 1
+  if (dialog.status_id === 3 || dialog.status_id === 4) promptId = 2
+  if (dialog.status_id === 5) promptId = 4
+  if (dialog.status_id === 6) promptId = 5
+  if (dialog.status_id === 7) promptId = 6
+
+  const prompt = await getPrompt(promptId)
+  const history = await getHistory(dialog.id, dialog.status_id === 3 || dialog.status_id === 4 ? 30 : 20)
+  const llmText = buildLLMUserText(text, incomingMessage)
+
+  await trace(traceId, 'router.deepseek_payload', {
+    dialog_id: dialog.id,
+    status_id: dialog.status_id,
+    prompt_id: promptId,
+    user_context: userContext,
+    history,
+    user_message: llmText,
+  })
+
+  const result = await callDeepSeek(prompt, userContext, history, llmText)
+
+  await trace(traceId, 'router.deepseek_response', {
+    reply: result.reply,
+    input_tokens: result.inputTokens,
+    output_tokens: result.outputTokens,
+    model: result.model,
+  })
+
+  await trace(traceId, 'router.send_skipped', {
+    reason: 'DEBUG_NO_SEND=true',
+    user_id: userId,
+  })
 }
 
 async function isAlreadyReplied(messageId) {
@@ -344,7 +423,7 @@ export default async function handler(req, res) {
   // Сразу отвечаем VK — не ждём обработки
   res.status(200).send('ok')
 
-  const { user_id, text, first_name, sex, incoming_message_id } = req.body
+  const { user_id, text, first_name, sex, incoming_message_id, trace_id } = req.body
   if (!user_id) return
 
   try {
@@ -360,6 +439,8 @@ export default async function handler(req, res) {
       }
     }
 
+    await trace(trace_id, 'router.request_received', req.body)
+
     if (incoming_message_id && await isAlreadyReplied(incoming_message_id)) {
       await log('router', 'Сообщение уже обработано — пропускаем', { incoming_message_id })
       return
@@ -368,6 +449,12 @@ export default async function handler(req, res) {
     await log('router', 'Входящее сообщение', { user_id, text })
 
     const dialog = await getDialog(user_id)
+
+    await trace(trace_id, 'router.dialog_loaded', {
+      dialog_id: dialog?.id ?? null,
+      status_id: dialog?.status_id ?? null,
+      user_message_count: dialog?.user_message_count ?? null,
+    })
 
     if (!dialog) {
       await log('router', 'Диалог не найден', { user_id }, 'error')

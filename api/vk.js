@@ -1,5 +1,6 @@
 import { supabase } from '../lib/supabase.js'
 import { callGeminiMultimodal } from '../lib/gemini.js'
+import { trace } from '../lib/debug-trace.js'
 
 // ── 1. fetchVkUser ───────────────────────────────────────────────────────────
 
@@ -207,9 +208,16 @@ async function transcribeAttachment(parsed) {
 
 // ── 6. saveMessageFromVk ─────────────────────────────────────────────────────
 
-async function saveMessageFromVk(body) {
+async function saveMessageFromVk(body, traceId) {
   const msg = body?.object?.message
   if (!msg) throw new Error('No message object in body')
+
+  await trace(traceId, 'vk.webhook_received', {
+    event_id: body?.event_id ?? null,
+    group_id: body?.group_id ?? null,
+    type: body?.type ?? null,
+    message: body?.object?.message ?? null,
+  })
 
   const { id: vk_message_id, from_id, peer_id, date, text, attachments = [] } = msg
   const event_id = body.event_id ?? null
@@ -222,18 +230,34 @@ async function saveMessageFromVk(body) {
       .insert({ event_id })
     if (dedupErr) {
       console.log('[vk] дубликат event_id, пропускаем:', event_id)
+      await trace(traceId, 'vk.processed_event_duplicate', { event_id }, 'warn')
       return null
     }
+    await trace(traceId, 'vk.processed_event_saved', { event_id })
   }
 
   // Пользователь и диалог
   await ensureUserExists(from_id)
+  await trace(traceId, 'vk.user_ensured', { vk_user_id: from_id })
   const dialog   = await ensureDialogExists(from_id, peer_id)
   const dialogId = dialog.id
 
+  await trace(traceId, 'vk.dialog_ensured', {
+    vk_user_id: from_id,
+    peer_id,
+    dialog_id: dialogId,
+    status_id: dialog.status_id,
+  })
+
   // Вложения
   const parsed         = parseAttachments(attachments)
+  await trace(traceId, 'vk.attachments_parsed', parsed)
   const { transcriptions } = await transcribeAttachment(parsed)
+
+  await trace(traceId, 'vk.attachment_transcribed', {
+    has_transcriptions: Boolean(transcriptions),
+    transcriptions,
+  })
 
   // INSERT message — только поля новой схемы
   const { data: savedMessage, error: msgErr } = await supabase
@@ -258,6 +282,16 @@ async function saveMessageFromVk(body) {
     .single()
 
   if (msgErr) throw msgErr
+
+  await trace(traceId, 'vk.message_saved', {
+    message_id: savedMessage?.id ?? null,
+    dialog_id: savedMessage?.dialog_id ?? null,
+    vk_message_id: savedMessage?.vk_message_id ?? null,
+    text: savedMessage?.text ?? null,
+    has_attachments: savedMessage?.has_attachments ?? null,
+    attachment_types: savedMessage?.attachment_types ?? null,
+    attachment_trans: savedMessage?.attachment_trans ?? null,
+  })
 
   // Обновляем счётчик и last_message_by в dialog
   await supabase
