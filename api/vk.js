@@ -326,6 +326,7 @@ export default async function handler(req, res) {
   if (body.type === 'message_new') {
     const msg        = body?.object?.message
     const vk_user_id = msg?.from_id
+    const traceId    = `vk-${body?.event_id ?? Date.now()}`
 
     let savedMessage = null
 
