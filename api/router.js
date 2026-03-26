@@ -427,18 +427,6 @@ export default async function handler(req, res) {
   if (!user_id) return
 
   try {
-    // Дедупликация на уровне роутера
-    const incomingEventId = req.body?.event_id ?? null
-    if (incomingEventId) {
-      const { error: dedupErr } = await supabase
-        .from('processed_events')
-        .insert({ event_id: incomingEventId })
-      if (dedupErr) {
-        await log('router', 'Дубликат event_id — пропускаем', { event_id: incomingEventId })
-        return
-      }
-    }
-
     await trace(trace_id, 'router.request_received', req.body)
 
     if (incoming_message_id && await isAlreadyReplied(incoming_message_id)) {
@@ -469,6 +457,19 @@ export default async function handler(req, res) {
 
     const sexLabel    = sex === 1 ? 'женщина' : sex === 2 ? 'мужчина' : 'неизвестно'
     const userContext = first_name ? `Имя клиента: ${first_name}. Пол: ${sexLabel}.` : ''
+
+    if (process.env.DEBUG_NO_SEND === 'true') {
+      await handleDebugPreview({
+        dialog,
+        userId: user_id,
+        text,
+        userContext,
+        incomingMessageId: incoming_message_id,
+        traceId: trace_id,
+      })
+      return
+    }
+
 
     const ctx = { dialog, userId: user_id, text, userContext, incomingMessageId: incoming_message_id }
 

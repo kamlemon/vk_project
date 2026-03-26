@@ -330,7 +330,7 @@ export default async function handler(req, res) {
     let savedMessage = null
 
     try {
-      savedMessage = await saveMessageFromVk(body)
+      savedMessage = await saveMessageFromVk(body, traceId)
     } catch (err) {
       console.error('[handler] saveMessageFromVk failed:', err.message)
     }
@@ -354,6 +354,8 @@ export default async function handler(req, res) {
         first_name:          userRow?.first_name ?? null,
         sex:                 userRow?.sex ?? null,
         incoming_message_id: savedMessage.id,
+        trace_id:            traceId,
+        event_id:            body?.event_id ?? null,
       },
     }
     const fakeRes = { status: () => ({ end: () => {}, send: () => {} }), send: () => {} }
