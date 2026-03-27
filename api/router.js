@@ -20,6 +20,25 @@ async function getPrompt(promptId) {
   return data?.prompt_content ?? null
 }
 
+
+async function getProduct(productId) {
+  const { data } = await supabase
+    .from('product')
+    .select('description')
+    .eq('product_id', productId)
+    .maybeSingle()
+
+  if (!data) await log('router', `Продукт ${productId} не найден`, null, 'warn')
+  return data?.description ?? null
+}
+
+function buildFullPrompt(prompt, productDescription = null) {
+  return [
+    prompt ?? '',
+    productDescription ? `Описание продукта:\n${productDescription}` : '',
+  ].filter(Boolean).join('\n\n')
+}
+
 // ── Загрузка истории диалога ─────────────────────────────────────────────────
 
 async function getHistory(dialogId, limit = 20) {
@@ -130,9 +149,6 @@ function buildLLMUserText(text, incomingMessage) {
     `attachment_types: ${incomingMessage?.attachment_types ?? ''}`,
     `has_attachment_trans: ${Boolean(trans)}`,
     '',
-    'Правило: если пользователь просит анализ по фото ладони, но описание вложения отсутствует, не выдумывай анализ и вежливо попроси прислать фото ладони.',
-    'Если пользователь дал дату рождения текстом, можно делать анализ по дате рождения.',
-    '',
     'Текст пользователя:',
     text ?? '',
     '',
@@ -152,6 +168,8 @@ async function handleDebugPreview({ dialog, userId, text, userContext, incomingM
   if (dialog.status_id === 7) promptId = 6
 
   const prompt = await getPrompt(promptId)
+  const productDescription = promptId === 1 ? await getProduct(1) : null
+  const fullPrompt = buildFullPrompt(prompt, productDescription)
   const history = await getHistory(dialog.id, dialog.status_id === 3 || dialog.status_id === 4 ? 30 : 20)
   const llmText = buildLLMUserText(text, incomingMessage)
 
@@ -159,12 +177,13 @@ async function handleDebugPreview({ dialog, userId, text, userContext, incomingM
     dialog_id: dialog.id,
     status_id: dialog.status_id,
     prompt_id: promptId,
+    system_prompt: fullPrompt,
     user_context: userContext,
     history,
     user_message: llmText,
   })
 
-  const result = await callDeepSeek(prompt, userContext, history, llmText)
+  const result = await callDeepSeek(fullPrompt, userContext, history, llmText)
 
   await trace(traceId, 'router.deepseek_response', {
     reply: result.reply,
@@ -223,11 +242,15 @@ async function callLLM({ prompt, userContext, history, text, source }) {
 
 async function handleStatus12({ dialog, userId, text, userContext, incomingMessageId }) {
   const dialogId = dialog.id
-  const prompt   = await getPrompt(1)
-  const history  = await getHistory(dialogId)
+  const incomingMessage = await getIncomingMessage(incomingMessageId)
+  const prompt = await getPrompt(1)
+  const productDescription = await getProduct(1)
+  const fullPrompt = buildFullPrompt(prompt, productDescription)
+  const history = await getHistory(dialogId)
+  const llmText = buildLLMUserText(text, incomingMessage)
 
   const { reply: rawReply, inputTokens, outputTokens, model: usedModel } =
-    await callLLM({ prompt, userContext, history, text, source: 'status-1-2' })
+    await callLLM({ prompt: fullPrompt, userContext, history, text: llmText, source: 'status-1-2' })
 
   // Проверяем метку диагностики
   const diagnosisDone = rawReply.includes(DIAGNOSIS_MARKER)
