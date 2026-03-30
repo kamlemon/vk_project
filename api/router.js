@@ -39,6 +39,32 @@ function buildFullPrompt(prompt, productDescription = null) {
   ].filter(Boolean).join('\n\n')
 }
 
+
+async function getStaticPrompt(promptId) {
+  const { data } = await supabase
+    .from('prompt')
+    .select('prompt_content')
+    .eq('prompt_id', promptId)
+    .eq('is_active', true)
+    .maybeSingle()
+
+  return data?.prompt_content ?? null
+}
+
+async function maybeSendMessage({ userId, text, traceId, statusId, extra = {} }) {
+  if (process.env.DEBUG_NO_SEND === 'true') {
+    await trace(traceId ?? `send-${userId}-${Date.now()}`, 'router.send_skipped', {
+      reason: 'DEBUG_NO_SEND=true',
+      user_id: userId,
+      status_id: statusId,
+      ...extra,
+    })
+    return null
+  }
+
+  return await sendMessage(userId, text)
+}
+
 // ── Загрузка истории диалога ─────────────────────────────────────────────────
 
 async function getHistory(dialogId, limit = 20) {
@@ -240,203 +266,414 @@ async function callLLM({ prompt, userContext, history, text, source }) {
 
 // ── STATUS 1, 2 — Знакомство + бесплатная диагностика ───────────────────────
 
-async function handleStatus12({ dialog, userId, text, userContext, incomingMessageId }) {
+async function handleStatus12({ dialog, userId, text, userContext, incomingMessageId, traceId }) {
   const dialogId = dialog.id
   const incomingMessage = await getIncomingMessage(incomingMessageId)
+  const projectedUserMsgCount = (dialog.user_message_count ?? 0) + 1
+
+  // Если дошли до 30 сообщений и free ещё не оказана -> переводим в status 3
+  if (!dialog.free_service_done && projectedUserMsgCount >= 30) {
+    return await handleStatus3({
+      dialog: {
+        ...dialog,
+        status_id: 3,
+        user_message_count: projectedUserMsgCount,
+      },
+      userId,
+      text,
+      userContext,
+      incomingMessageId,
+      traceId,
+      firstEntryToStatus3: true,
+    })
+  }
+
   const prompt = await getPrompt(1)
   const productDescription = await getProduct(1)
   const fullPrompt = buildFullPrompt(prompt, productDescription)
   const history = await getHistory(dialogId)
   const llmText = buildLLMUserText(text, incomingMessage)
 
+  await trace(traceId, 'router.deepseek_payload', {
+    dialog_id: dialog.id,
+    status_id: dialog.status_id,
+    prompt_id: 1,
+    system_prompt: fullPrompt,
+    user_context: userContext,
+    history,
+    user_message: llmText,
+  })
+
   const { reply: rawReply, inputTokens, outputTokens, model: usedModel } =
     await callLLM({ prompt: fullPrompt, userContext, history, text: llmText, source: 'status-1-2' })
 
-  // Проверяем метку диагностики
+  await trace(traceId, 'router.deepseek_response', {
+    reply: rawReply,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    model: usedModel,
+  })
+
   const diagnosisDone = rawReply.includes(DIAGNOSIS_MARKER)
-  const reply         = rawReply.replace(DIAGNOSIS_MARKER, '').trim()
+  const reply = rawReply.replace(DIAGNOSIS_MARKER, '').trim()
 
   await saveReply({ dialogId, userId, reply, usedModel, replyToId: incomingMessageId })
   await saveTokens({ userId, dialogId, inputTokens, outputTokens, usedModel })
   await markReplied(incomingMessageId)
 
-  const newUserMsgCount = (dialog.user_message_count ?? 0) + 1
-
   const updateFields = {
-    message_count:      (dialog.message_count ?? 0) + 1,
-    user_message_count: newUserMsgCount,
-    last_message_at:    new Date().toISOString(),
-    last_message_by:    'bot',
+    message_count: (dialog.message_count ?? 0) + 1,
+    user_message_count: projectedUserMsgCount,
+    last_message_at: new Date().toISOString(),
+    last_message_by: 'bot',
+    status_id: 2,
   }
 
   if (diagnosisDone) {
     updateFields.free_service_done = true
-    await log('status-1-2', 'Диагностика выполнена → free_service_done = true', { dialogId })
-  }
-
-  if (newUserMsgCount >= 30) {
-    updateFields.status_id = diagnosisDone || dialog.free_service_done ? 4 : 3
-    await log('status-1-2', `30 сообщений → status_id = ${updateFields.status_id}`, { dialogId })
+    updateFields.status_id = 4
+    updateFields.prompt_3_scheduled_at = new Date(Date.now() + 10 * 60 * 1000).toISOString()
   }
 
   await updateDialog(dialogId, updateFields)
-  await sendMessage(userId, reply)
-  await log('status-1-2', 'Ответ отправлен', { userId })
+
+  await maybeSendMessage({
+    userId,
+    text: reply,
+    traceId,
+    statusId: updateFields.status_id,
+    extra: { prompt_id: 1 },
+  })
 }
 
-// ── STATUS 3, 4 — Анализ + переход к услугам ────────────────────────────────
+// ── STATUS 3 — бесплатная услуга не оказана ───────────────────────────────
 
-async function handleStatus34({ dialog, userId, text, userContext, incomingMessageId }) {
+async function handleStatus3({
+  dialog,
+  userId,
+  text,
+  userContext,
+  incomingMessageId,
+  traceId,
+  firstEntryToStatus3 = false,
+}) {
   const dialogId = dialog.id
+  const incomingMessage = await getIncomingMessage(incomingMessageId)
 
-  // Если prompt_3 уже запланирован — проверяем время
-  if (dialog.prompt_3_scheduled_at) {
-    const scheduledAt = new Date(dialog.prompt_3_scheduled_at)
-    const now         = new Date()
+  // Первый вход в status 3 -> отрабатываем prompt 2 и ставим таймер на prompt 3
+  if (firstEntryToStatus3 || !dialog.prompt_3_scheduled_at) {
+    const prompt = await getPrompt(2)
+    const history = await getHistory(dialogId)
+    const llmText = buildLLMUserText(text, incomingMessage)
 
-    if (now >= scheduledAt) {
-      // Время вышло — отправляем статичный текст услуг
-      const staticText = await getPrompt(3)
+    await trace(traceId, 'router.deepseek_payload', {
+      dialog_id: dialog.id,
+      status_id: 3,
+      prompt_id: 2,
+      system_prompt: prompt,
+      user_context: userContext,
+      history,
+      user_message: llmText,
+    })
 
-      if (staticText) {
-        await sendMessage(userId, staticText)
-        await saveReply({
-          dialogId,
-          userId,
-          reply:    staticText,
-          usedModel: 'static',
-          replyToId: null,
-        })
-        await updateDialog(dialogId, {
-          status_id:       5,
-          last_message_at: new Date().toISOString(),
-          last_message_by: 'bot',
-        })
-        await log('status-3-4', 'Статичный текст услуг отправлен → status_id = 5', { dialogId })
-      }
+    const { reply, inputTokens, outputTokens, model: usedModel } =
+      await callLLM({ prompt, userContext, history, text: llmText, source: 'status-3' })
 
-      // На сообщение юзера не отвечаем — только отправили статику
-      await markReplied(incomingMessageId)
-      return
-    }
+    await trace(traceId, 'router.deepseek_response', {
+      reply,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      model: usedModel,
+    })
 
-    // 10 минут ещё не вышло — молчим
-    await log('status-3-4', 'Ждём 10 минут — молчим', { dialogId, scheduledAt })
+    await saveReply({ dialogId, userId, reply, usedModel, replyToId: incomingMessageId })
+    await saveTokens({ userId, dialogId, inputTokens, outputTokens, usedModel })
+    await markReplied(incomingMessageId)
+
+    await updateDialog(dialogId, {
+      status_id: 3,
+      message_count: (dialog.message_count ?? 0) + 1,
+      user_message_count: dialog.user_message_count ?? 30,
+      last_message_at: new Date().toISOString(),
+      last_message_by: 'bot',
+      prompt_3_scheduled_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+    })
+
+    await maybeSendMessage({
+      userId,
+      text: reply,
+      traceId,
+      statusId: 3,
+      extra: { prompt_id: 2 },
+    })
+    return
+  }
+
+  // Если таймер ещё не истёк -> молчим
+  const scheduledAt = new Date(dialog.prompt_3_scheduled_at)
+  const now = new Date()
+
+  if (now < scheduledAt) {
+    await trace(traceId, 'router.ignored_by_status', {
+      dialog_id: dialogId,
+      status_id: 3,
+      reason: 'waiting_prompt_3_timeout',
+      prompt_3_scheduled_at: dialog.prompt_3_scheduled_at,
+    })
     await markReplied(incomingMessageId)
     return
   }
 
-  // prompt_3 ещё не запланирован — отвечаем через нейронку (prompt_id = 2)
-  const prompt  = await getPrompt(2)
-  const history = await getHistory(dialogId, 30)
+  // Если 10 минут прошли -> отправляем статичный prompt 3 и переводим в status 5
+  const staticText = await getStaticPrompt(3)
+  if (!staticText) {
+    await log('status-3', 'Не найден static prompt 3', { dialogId }, 'error')
+    return
+  }
 
-  const { reply, inputTokens, outputTokens, model: usedModel } =
-    await callLLM({ prompt, userContext, history, text, source: 'status-3-4' })
-
-  await saveReply({ dialogId, userId, reply, usedModel, replyToId: incomingMessageId })
-  await saveTokens({ userId, dialogId, inputTokens, outputTokens, usedModel })
-  await markReplied(incomingMessageId)
-
-  // Планируем отправку статики через 10 минут
-  const scheduledAt = new Date(Date.now() + 10 * 60 * 1000).toISOString()
-
-  await updateDialog(dialogId, {
-    message_count:         (dialog.message_count ?? 0) + 1,
-    last_message_at:       new Date().toISOString(),
-    last_message_by:       'bot',
-    prompt_3_scheduled_at: scheduledAt,
+  await saveReply({
+    dialogId,
+    userId,
+    reply: staticText,
+    usedModel: 'static',
+    replyToId: null,
   })
 
-  await log('status-3-4', 'prompt_3 запланирован', { scheduledAt })
-  await sendMessage(userId, reply)
-  await log('status-3-4', 'Ответ отправлен', { userId })
-}
-
-
-// ── STATUS 5 — Продажа продукта ──────────────────────────────────────────────
-
-async function handleStatus5({ dialog, userId, text, userContext, incomingMessageId }) {
-  const dialogId = dialog.id
-  const prompt   = await getPrompt(4)
-  const history  = await getHistory(dialogId)
-
-  const { reply, inputTokens, outputTokens, model: usedModel } =
-    await callLLM({ prompt, userContext, history, text, source: 'status-5' })
-
-  await saveReply({ dialogId, userId, reply, usedModel, replyToId: incomingMessageId })
-  await saveTokens({ userId, dialogId, inputTokens, outputTokens, usedModel })
-  await markReplied(incomingMessageId)
   await updateDialog(dialogId, {
-    message_count:   (dialog.message_count ?? 0) + 1,
+    status_id: 5,
+    offer_sent_at: new Date().toISOString(),
     last_message_at: new Date().toISOString(),
     last_message_by: 'bot',
   })
 
-  await sendMessage(userId, reply)
-  await log('status-5', 'Ответ отправлен', { userId })
+  await markReplied(incomingMessageId)
+
+  await maybeSendMessage({
+    userId,
+    text: staticText,
+    traceId,
+    statusId: 3,
+    extra: { prompt_id: 3, static: true },
+  })
+}
+
+// ── STATUS 4 — бесплатная услуга оказана ─────────────────────────────────────
+
+async function handleStatus4({ dialog, userId, incomingMessageId, traceId }) {
+  const dialogId = dialog.id
+  const scheduledAt = dialog.prompt_3_scheduled_at ? new Date(dialog.prompt_3_scheduled_at) : null
+  const now = new Date()
+
+  if (!scheduledAt || now < scheduledAt) {
+    await trace(traceId, 'router.ignored_by_status', {
+      dialog_id: dialogId,
+      status_id: 4,
+      free_service_done: dialog.free_service_done,
+      reason: 'waiting_prompt_3_timeout',
+      prompt_3_scheduled_at: dialog.prompt_3_scheduled_at,
+    })
+    await markReplied(incomingMessageId)
+    return
+  }
+
+  const staticText = await getStaticPrompt(3)
+  if (!staticText) {
+    await log('status-4', 'Не найден static prompt 3', { dialogId }, 'error')
+    return
+  }
+
+  await saveReply({
+    dialogId,
+    userId,
+    reply: staticText,
+    usedModel: 'static',
+    replyToId: null,
+  })
+
+  await updateDialog(dialogId, {
+    status_id: 5,
+    offer_sent_at: new Date().toISOString(),
+    last_message_at: new Date().toISOString(),
+    last_message_by: 'bot',
+  })
+
+  await markReplied(incomingMessageId)
+
+  await maybeSendMessage({
+    userId,
+    text: staticText,
+    traceId,
+    statusId: 4,
+    extra: { prompt_id: 3, static: true },
+  })
+}
+
+// ── STATUS 5 — Продажа продукта ──────────────────────────────────────────────
+
+async function handleStatus5({ dialog, userId, text, userContext, incomingMessageId, traceId }) {
+  const dialogId = dialog.id
+  const incomingMessage = await getIncomingMessage(incomingMessageId)
+  const prompt = await getPrompt(4)
+  const history = await getHistory(dialogId)
+  const llmText = buildLLMUserText(text, incomingMessage)
+
+  await trace(traceId, 'router.deepseek_payload', {
+    dialog_id: dialog.id,
+    status_id: 5,
+    prompt_id: 4,
+    system_prompt: prompt,
+    user_context: userContext,
+    history,
+    user_message: llmText,
+  })
+
+  const { reply, inputTokens, outputTokens, model: usedModel } =
+    await callLLM({ prompt, userContext, history, text: llmText, source: 'status-5' })
+
+  await trace(traceId, 'router.deepseek_response', {
+    reply,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    model: usedModel,
+  })
+
+  await saveReply({ dialogId, userId, reply, usedModel, replyToId: incomingMessageId })
+  await saveTokens({ userId, dialogId, inputTokens, outputTokens, usedModel })
+  await markReplied(incomingMessageId)
+
+  await updateDialog(dialogId, {
+    message_count: (dialog.message_count ?? 0) + 1,
+    last_message_at: new Date().toISOString(),
+    last_message_by: 'bot',
+    status_id: 5,
+  })
+
+  await maybeSendMessage({
+    userId,
+    text: reply,
+    traceId,
+    statusId: 5,
+    extra: { prompt_id: 4 },
+  })
 }
 
 // ── STATUS 6 — Ведение по продукту ───────────────────────────────────────────
 
-async function handleStatus6({ dialog, userId, text, userContext, incomingMessageId }) {
+async function handleStatus6({ dialog, userId, text, userContext, incomingMessageId, traceId }) {
   const dialogId = dialog.id
+  const incomingMessage = await getIncomingMessage(incomingMessageId)
 
-  // Берём промпт + описание продукта
   const prompt = await getPrompt(5)
 
   const { data: product } = await supabase
     .from('product')
     .select('name, description')
-    .eq('product_id', 2)
+    .eq('product_id', dialog.product_id ?? 1)
     .maybeSingle()
 
   const productContext = product
-    ? `\n\nПродукт с которым ведётся работа:\n${product.name}\n\n${product.description}`
+    ? `
+
+Продукт:
+${product.name}
+
+${product.description}`
     : ''
 
   const fullPrompt = (prompt ?? '') + productContext
-  const history    = await getHistory(dialogId)
+  const history = await getHistory(dialogId)
+  const llmText = buildLLMUserText(text, incomingMessage)
+
+  await trace(traceId, 'router.deepseek_payload', {
+    dialog_id: dialog.id,
+    status_id: 6,
+    prompt_id: 5,
+    system_prompt: fullPrompt,
+    user_context: userContext,
+    history,
+    user_message: llmText,
+  })
 
   const { reply, inputTokens, outputTokens, model: usedModel } =
-    await callLLM({ prompt: fullPrompt, userContext, history, text, source: 'status-6' })
+    await callLLM({ prompt: fullPrompt, userContext, history, text: llmText, source: 'status-6' })
+
+  await trace(traceId, 'router.deepseek_response', {
+    reply,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    model: usedModel,
+  })
 
   await saveReply({ dialogId, userId, reply, usedModel, replyToId: incomingMessageId })
   await saveTokens({ userId, dialogId, inputTokens, outputTokens, usedModel })
   await markReplied(incomingMessageId)
+
   await updateDialog(dialogId, {
-    message_count:   (dialog.message_count ?? 0) + 1,
+    message_count: (dialog.message_count ?? 0) + 1,
     last_message_at: new Date().toISOString(),
     last_message_by: 'bot',
+    status_id: 6,
   })
 
-  await sendMessage(userId, reply)
-  await log('status-6', 'Ответ отправлен', { userId })
+  await maybeSendMessage({
+    userId,
+    text: reply,
+    traceId,
+    statusId: 6,
+    extra: { prompt_id: 5, product_id: dialog.product_id ?? 1 },
+  })
 }
+
 
 // ── STATUS 7 — Завершение ────────────────────────────────────────────────────
 
-async function handleStatus7({ dialog, userId, text, userContext, incomingMessageId }) {
+async function handleStatus7({ dialog, userId, text, userContext, incomingMessageId, traceId }) {
   const dialogId = dialog.id
-  const prompt   = await getPrompt(6)
-  const history  = await getHistory(dialogId, 50)
+  const incomingMessage = await getIncomingMessage(incomingMessageId)
+  const prompt = await getPrompt(6)
+  const history = await getHistory(dialogId, 50)
+  const llmText = buildLLMUserText(text, incomingMessage)
+
+  await trace(traceId, 'router.deepseek_payload', {
+    dialog_id: dialog.id,
+    status_id: 7,
+    prompt_id: 6,
+    system_prompt: prompt,
+    user_context: userContext,
+    history,
+    user_message: llmText,
+  })
 
   const { reply, inputTokens, outputTokens, model: usedModel } =
-    await callLLM({ prompt, userContext, history, text, source: 'status-7' })
+    await callLLM({ prompt, userContext, history, text: llmText, source: 'status-7' })
+
+  await trace(traceId, 'router.deepseek_response', {
+    reply,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    model: usedModel,
+  })
 
   await saveReply({ dialogId, userId, reply, usedModel, replyToId: incomingMessageId })
   await saveTokens({ userId, dialogId, inputTokens, outputTokens, usedModel })
   await markReplied(incomingMessageId)
+
   await updateDialog(dialogId, {
-    message_count:   (dialog.message_count ?? 0) + 1,
+    message_count: (dialog.message_count ?? 0) + 1,
     last_message_at: new Date().toISOString(),
     last_message_by: 'bot',
-    status_id:       3,
+    status_id: 3,
   })
 
-  await log('status-7', 'Завершение → status_id = 3', { dialogId })
-  await sendMessage(userId, reply)
-  await log('status-7', 'Ответ отправлен', { userId })
+  await maybeSendMessage({
+    userId,
+    text: reply,
+    traceId,
+    statusId: 7,
+    extra: { prompt_id: 6 },
+  })
 }
+
 
 // ── Главный handler ───────────────────────────────────────────────────────────
 
@@ -481,30 +718,31 @@ export default async function handler(req, res) {
     const sexLabel    = sex === 1 ? 'женщина' : sex === 2 ? 'мужчина' : 'неизвестно'
     const userContext = first_name ? `Имя клиента: ${first_name}. Пол: ${sexLabel}.` : ''
 
-    if (process.env.DEBUG_NO_SEND === 'true') {
-      await handleDebugPreview({
-        dialog,
-        userId: user_id,
-        text,
-        userContext,
-        incomingMessageId: incoming_message_id,
-        traceId: trace_id,
-      })
-      return
+
+    const ctx = {
+      dialog,
+      userId: user_id,
+      text,
+      userContext,
+      incomingMessageId: incoming_message_id,
+      traceId: trace_id,
     }
-
-
-    const ctx = { dialog, userId: user_id, text, userContext, incomingMessageId: incoming_message_id }
 
     const statusId = dialog.status_id
 
     if (statusId === 1 || statusId === 2) { await handleStatus12(ctx); return }
-    if (statusId === 3 || statusId === 4) { await handleStatus34(ctx); return }
+    if (statusId === 3)                   { await handleStatus3(ctx);  return }
+    if (statusId === 4)                   { await handleStatus4(ctx);  return }
     if (statusId === 5)                   { await handleStatus5(ctx);  return }
     if (statusId === 6)                   { await handleStatus6(ctx);  return }
     if (statusId === 7)                   { await handleStatus7(ctx);  return }
 
-    await log('router', 'Неизвестный status_id', { statusId }, 'warn')
+    await trace(trace_id, 'router.ignored_by_status', {
+      dialog_id: dialog.id,
+      status_id: statusId,
+      free_service_done: dialog.free_service_done,
+      reason: 'status_not_in_flow',
+    })
 
   } catch (err) {
     await log('router', 'ОШИБКА', { error: err.message }, 'error')
