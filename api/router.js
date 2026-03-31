@@ -52,6 +52,13 @@ async function getStaticPrompt(promptId) {
 }
 
 async function maybeSendMessage({ userId, text, traceId, statusId, extra = {} }) {
+  await trace(traceId ?? `send-${userId}-${Date.now()}`, 'router.send_attempt', {
+    user_id: userId,
+    status_id: statusId,
+    text_preview: text ? text.slice(0, 200) : '',
+    ...extra,
+  })
+
   if (process.env.DEBUG_NO_SEND === 'true') {
     await trace(traceId ?? `send-${userId}-${Date.now()}`, 'router.send_skipped', {
       reason: 'DEBUG_NO_SEND=true',
@@ -62,8 +69,28 @@ async function maybeSendMessage({ userId, text, traceId, statusId, extra = {} })
     return null
   }
 
-  return await sendMessage(userId, text)
+  try {
+    const result = await sendMessage(userId, text)
+
+    await trace(traceId ?? `send-${userId}-${Date.now()}`, 'router.send_success', {
+      user_id: userId,
+      status_id: statusId,
+      result,
+      ...extra,
+    })
+
+    return result
+  } catch (err) {
+    await trace(traceId ?? `send-${userId}-${Date.now()}`, 'router.send_failed', {
+      user_id: userId,
+      status_id: statusId,
+      error: err.message,
+      ...extra,
+    }, 'error')
+    throw err
+  }
 }
+
 
 // ── Загрузка истории диалога ─────────────────────────────────────────────────
 
@@ -318,8 +345,24 @@ async function handleStatus12({ dialog, userId, text, userContext, incomingMessa
   const reply = rawReply.replace(DIAGNOSIS_MARKER, '').trim()
 
   await saveReply({ dialogId, userId, reply, usedModel, replyToId: incomingMessageId })
+  await trace(traceId, 'router.post_llm_saveReply_done', {
+    dialog_id: dialogId,
+    incoming_message_id: incomingMessageId,
+    used_model: usedModel,
+  })
+
   await saveTokens({ userId, dialogId, inputTokens, outputTokens, usedModel })
+  await trace(traceId, 'router.post_llm_saveTokens_done', {
+    dialog_id: dialogId,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    used_model: usedModel,
+  })
+
   await markReplied(incomingMessageId)
+  await trace(traceId, 'router.post_llm_markReplied_done', {
+    incoming_message_id: incomingMessageId,
+  })
 
   const updateFields = {
     message_count: (dialog.message_count ?? 0) + 1,
@@ -336,6 +379,10 @@ async function handleStatus12({ dialog, userId, text, userContext, incomingMessa
   }
 
   await updateDialog(dialogId, updateFields)
+  await trace(traceId, 'router.post_llm_updateDialog_done', {
+    dialog_id: dialogId,
+    update_fields: updateFields,
+  })
 
   await maybeSendMessage({
     userId,
