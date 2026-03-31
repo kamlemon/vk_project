@@ -155,13 +155,32 @@ async function saveTokens({ userId, dialogId, inputTokens, outputTokens, usedMod
 // ── Обновление диалога ───────────────────────────────────────────────────────
 
 async function updateDialog(dialogId, fields) {
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from('dialog')
     .update(fields)
     .eq('id', dialogId)
+    .select('id, status_id, free_service_done, prompt_3_scheduled_at, offer_sent_at, last_message_at, last_message_by, message_count, user_message_count')
+    .single()
 
-  if (error) await log('router', 'Ошибка обновления диалога', { error: error.message }, 'error')
+  if (error) {
+    await trace(`dialog-${dialogId}-${Date.now()}`, 'router.update_dialog_failed', {
+      dialog_id: dialogId,
+      fields,
+      error: error.message,
+    }, 'error')
+
+    throw new Error(`updateDialog failed: ${error.message}`)
+  }
+
+  await trace(`dialog-${dialogId}-${Date.now()}`, 'router.update_dialog_success', {
+    dialog_id: dialogId,
+    fields,
+    persisted: data,
+  })
+
+  return data
 }
+
 
 // ── Пометить входящее как обработанное ──────────────────────────────────────
 
