@@ -3,8 +3,12 @@ import { callDeepSeek } from '../lib/deepseek.js'
 import { sendMessage } from '../lib/vk.js'
 import { log } from '../lib/logger.js'
 import { trace } from '../lib/debug-trace.js'
+import { initPaymentUrl } from '../lib/getplatinum.js'
 
 const DIAGNOSIS_MARKER = '[ДИАГНОСТИКА_ВЫПОЛНЕНА]'
+const PAYMENT_LINK_TRIGGER_RE = /(давай ссылку|хочу ссылку|хочу оплатить|готов оплатить|оплатить|оплачиваю|беру)/i
+const TEST_PAYMENT_AMOUNT = 1000
+
 
 // ── Загрузка промпта из БД ───────────────────────────────────────────────────
 
@@ -576,10 +580,154 @@ async function handleStatus4({ dialog, userId, incomingMessageId, traceId }) {
   })
 }
 
+
+function isPaymentLinkRequest(text) {
+  return PAYMENT_LINK_TRIGGER_RE.test((text ?? '').trim())
+}
+
+async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMessageId, traceId }) {
+  const dialogId = dialog.id
+  const amount = TEST_PAYMENT_AMOUNT
+  const email = process.env.GETPLATINUM_TEST_EMAIL ?? null
+  const phone = process.env.GETPLATINUM_TEST_PHONE ?? null
+  const notificationUrl = process.env.GETPLATINUM_NOTIFICATION_URL ?? null
+  const successUrl = process.env.GETPLATINUM_SUCCESS_URL ?? null
+  const failUrl = process.env.GETPLATINUM_FAIL_URL ?? null
+  const name = (firstName ?? 'Клиент').trim() || 'Клиент'
+
+  try {
+    if (!email && !phone) {
+      throw new Error('GETPLATINUM_TEST_EMAIL or GETPLATINUM_TEST_PHONE is required')
+    }
+
+    if (!notificationUrl || !successUrl || !failUrl) {
+      throw new Error('GetPlatinum notification/success/fail URLs are not configured')
+    }
+
+    const dealId = `vk-${dialogId}-${Date.now()}`
+    const init = await initPaymentUrl({
+      dealId,
+      amount,
+      currency: 'RUB',
+      title: 'Тестовая оплата настройки финансового потока',
+      clientId: `vk-${userId}`,
+      email,
+      phone,
+      name,
+      notificationUrl,
+      successUrl,
+      failUrl,
+      customParams: {
+        dialogId,
+        vkUserId: userId,
+        productId: 1,
+        source: 'vk_bot',
+      },
+    })
+
+    await trace(traceId, 'router.getplatinum_payment_link_created', {
+      dialog_id: dialogId,
+      deal_id: dealId,
+      amount,
+      form_url: init.formUrl,
+    })
+
+    const { error: paymentErr } = await supabase
+      .from('payment')
+      .insert({
+        dialog_id: dialogId,
+        vk_user_id: userId,
+        deal_id: dealId,
+        amount,
+        currency: 'RUB',
+        status: 'created',
+        provider: 'getplatinum',
+        form_url: init.formUrl,
+        raw_init: init,
+      })
+
+    if (paymentErr) throw paymentErr
+
+    await trace(traceId, 'router.payment_saved', {
+      dialog_id: dialogId,
+      deal_id: dealId,
+    })
+
+    const reply = `${name}, вот ссылка на оплату тестового платежа 10 ₽:\n${init.formUrl}\n\nКак только оплата пройдет, я сразу увижу подтверждение и переведу тебя в следующий этап.`
+
+    await saveReply({
+      dialogId,
+      userId,
+      reply,
+      usedModel: 'getplatinum-link',
+      replyToId: incomingMessageId,
+    })
+
+    await markReplied(incomingMessageId)
+
+    await updateDialog(dialogId, {
+      status_id: 5,
+      message_count: (dialog.message_count ?? 0) + 1,
+      last_message_at: new Date().toISOString(),
+      last_message_by: 'bot',
+    })
+
+    await maybeSendMessage({
+      userId,
+      text: reply,
+      traceId,
+      statusId: 5,
+      extra: {
+        prompt_id: 'getplatinum_link',
+        deal_id: dealId,
+      },
+    })
+
+  } catch (err) {
+    await trace(traceId, 'router.getplatinum_payment_link_failed', {
+      dialog_id: dialogId,
+      error: err.message,
+    }, 'error')
+
+    const fallback = 'Не смогла сейчас сформировать ссылку на оплату. Это технический момент. Попробуй ещё раз через минуту.'
+
+    await saveReply({
+      dialogId,
+      userId,
+      reply: fallback,
+      usedModel: 'system',
+      replyToId: incomingMessageId,
+    })
+
+    await markReplied(incomingMessageId)
+
+    await maybeSendMessage({
+      userId,
+      text: fallback,
+      traceId,
+      statusId: 5,
+      extra: {
+        prompt_id: 'getplatinum_link_error',
+      },
+    })
+  }
+}
+
 // ── STATUS 5 — Продажа продукта ──────────────────────────────────────────────
 
-async function handleStatus5({ dialog, userId, text, userContext, incomingMessageId, traceId }) {
+async function handleStatus5({ dialog, userId, text, userContext, incomingMessageId, traceId, firstName }) {
   const dialogId = dialog.id
+
+  if (isPaymentLinkRequest(text)) {
+    return await handleStatus5PaymentLink({
+      dialog,
+      userId,
+      firstName,
+      incomingMessageId,
+      traceId,
+    })
+  }
+
   const incomingMessage = await getIncomingMessage(incomingMessageId)
   const prompt = await getPrompt(4)
   const history = await getHistory(dialogId)
@@ -794,6 +942,7 @@ export default async function handler(req, res) {
       userContext,
       incomingMessageId: incoming_message_id,
       traceId: trace_id,
+      firstName: first_name,
     }
 
     const statusId = dialog.status_id
