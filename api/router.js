@@ -396,7 +396,7 @@ async function handleStatus12({ dialog, userId, text, userContext, incomingMessa
     updateFields.free_service_done = true
     updateFields.free_done_at = freeDoneAt
     updateFields.status_id = 4
-    updateFields.prompt_3_scheduled_at = new Date(Date.now() + 10 * 60 * 1000).toISOString()
+    updateFields.prompt_3_scheduled_at = new Date(Date.now() + 12 * 60 * 1000).toISOString()
   }
 
   await updateDialog(dialogId, updateFields)
