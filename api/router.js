@@ -159,7 +159,7 @@ async function updateDialog(dialogId, fields) {
     .from('dialog')
     .update(fields)
     .eq('id', dialogId)
-    .select('id, status_id, free_service_done, prompt_3_scheduled_at, offer_sent_at, last_message_at, last_message_by, message_count, user_message_count')
+    .select('id, status_id, free_service_done, free_done_at, prompt_3_scheduled_at, offer_sent_at, last_message_at, last_message_by, message_count, user_message_count')
     .single()
 
   if (error) {
@@ -392,7 +392,9 @@ async function handleStatus12({ dialog, userId, text, userContext, incomingMessa
   }
 
   if (diagnosisDone) {
+    const freeDoneAt = new Date().toISOString()
     updateFields.free_service_done = true
+    updateFields.free_done_at = freeDoneAt
     updateFields.status_id = 4
     updateFields.prompt_3_scheduled_at = new Date(Date.now() + 10 * 60 * 1000).toISOString()
   }
