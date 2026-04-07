@@ -3,6 +3,13 @@ import { trace } from '../lib/debug-trace.js'
 import { verifyGetPlatinumChecksum } from '../lib/getplatinum.js'
 import { sendMessage } from '../lib/vk.js'
 
+const PAID_PRODUCT_ID = 2
+const PRODUCT_CYCLE_DELAY_MINUTES = Number(process.env.PRODUCT_CYCLE_DELAY_MINUTES ?? 5)
+
+function plusMinutesIso(minutes) {
+  return new Date(Date.now() + minutes * 60 * 1000).toISOString()
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' })
@@ -86,12 +93,35 @@ export default async function handler(req, res) {
   })
 
   if (notificationType === 1 && isSuccess) {
+    const productId = Number(body?.customParams?.productId ?? PAID_PRODUCT_ID) || PAID_PRODUCT_ID
+    const nextActionAt = plusMinutesIso(PRODUCT_CYCLE_DELAY_MINUTES)
+
+    const { data: dialogBefore, error: dialogSelErr } = await supabase
+      .from('dialog')
+      .select('id, message_count')
+      .eq('id', payment.dialog_id)
+      .maybeSingle()
+
+    if (dialogSelErr) {
+      await trace(traceId, 'getplatinum.dialog_select_failed', {
+        dialog_id: payment.dialog_id,
+        error: dialogSelErr.message,
+      }, 'error')
+      return res.status(200).json({ ok: false, reason: 'dialog_select_failed' })
+    }
+
     const { error: dialogUpdErr } = await supabase
       .from('dialog')
       .update({
         status_id: 6,
+        product_id: productId,
+        product_step: 1,
+        cycle_started_at: now,
+        cycle_completed_at: null,
+        next_action_at: nextActionAt,
         last_message_at: now,
         last_message_by: 'bot',
+        message_count: (dialogBefore?.message_count ?? 0) + 1,
       })
       .eq('id', payment.dialog_id)
 
@@ -106,9 +136,12 @@ export default async function handler(req, res) {
     await trace(traceId, 'getplatinum.dialog_moved_to_status_6', {
       dialog_id: payment.dialog_id,
       vk_user_id: payment.vk_user_id,
+      product_id: productId,
+      product_step: 1,
+      next_action_at: nextActionAt,
     })
 
-    const reply = 'Оплату вижу — всё прошло успешно. Перевожу тебя в этап работы по продукту. Следующим сообщением напишу, как всё будет дальше.'
+    const reply = 'Оплату вижу — всё прошло успешно. Начинаю практику по продукту прямо сейчас. Первый этап уже запущен, а следующий шаг я отправлю сюда автоматически.'
 
     const { error: msgErr } = await supabase
       .from('message')

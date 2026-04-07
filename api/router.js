@@ -8,6 +8,21 @@ import { initPaymentUrl } from '../lib/getplatinum.js'
 const DIAGNOSIS_MARKER = '[ДИАГНОСТИКА_ВЫПОЛНЕНА]'
 const PAYMENT_LINK_TRIGGER_RE = /(давай ссылку|хочу ссылку|хочу оплатить|готов оплатить|оплатить|оплачиваю|беру)/i
 const TEST_PAYMENT_AMOUNT = 1000
+const PAID_PRODUCT_ID = 2
+const PRODUCT_CYCLE_REPLY_GRACE_MINUTES = Number(process.env.PRODUCT_CYCLE_REPLY_GRACE_MINUTES ?? 3)
+
+function maybePushNextActionAt(dialog) {
+  if (!dialog?.next_action_at || dialog?.cycle_completed_at) return {}
+
+  const currentNextActionAt = new Date(dialog.next_action_at)
+  if (Number.isNaN(currentNextActionAt.getTime())) return {}
+
+  const minNextActionAt = new Date(Date.now() + PRODUCT_CYCLE_REPLY_GRACE_MINUTES * 60 * 1000)
+  if (currentNextActionAt >= minNextActionAt) return {}
+
+  return { next_action_at: minNextActionAt.toISOString() }
+}
+
 
 
 // ── Загрузка промпта из БД ───────────────────────────────────────────────────
@@ -636,7 +651,7 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
       customParams: {
         dialogId,
         vkUserId: userId,
-        productId: 1,
+        productId: PAID_PRODUCT_ID,
         source: 'vk_bot',
       },
       positionPrefix: 9,
@@ -671,7 +686,10 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
       deal_id: dealId,
     })
 
-    const reply = `${name}, вот ссылка на оплату тестового платежа 10 ₽:\n${init.formUrl}\n\nКак только оплата пройдет, я сразу увижу подтверждение и переведу тебя в следующий этап.`
+    const reply = `${name}, вот ссылка на оплату тестового платежа ${amount} ₽:
+${init.formUrl}
+
+Как только оплата пройдет, я сразу увижу подтверждение и переведу тебя в следующий этап.`
 
     await saveReply({
       dialogId,
@@ -718,6 +736,13 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
     })
 
     await markReplied(incomingMessageId)
+
+    await updateDialog(dialogId, {
+      status_id: 5,
+      message_count: (dialog.message_count ?? 0) + 1,
+      last_message_at: new Date().toISOString(),
+      last_message_by: 'bot',
+    })
 
     await maybeSendMessage({
       userId,
@@ -798,12 +823,21 @@ async function handleStatus6({ dialog, userId, text, userContext, incomingMessag
   const incomingMessage = await getIncomingMessage(incomingMessageId)
 
   const prompt = await getPrompt(5)
+  const productId = dialog.product_id ?? PAID_PRODUCT_ID
 
   const { data: product } = await supabase
     .from('product')
     .select('name, description')
-    .eq('product_id', dialog.product_id ?? 1)
+    .eq('product_id', productId)
     .maybeSingle()
+
+  const orchestrationGuard = dialog.next_action_at && !dialog.cycle_completed_at
+    ? `
+
+Системное правило: автоэтап уже запланирован системой. Ты можешь поддержать человека и объяснить текущий процесс, но не обещай точное время, не придумывай новые этапы и не говори, что сама напишешь раньше запланированного шага.`
+    : `
+
+Системное правило: не обещай, что сама напишешь позже, если следующий автошаг не запланирован системой.`
 
   const productContext = product
     ? `
@@ -814,7 +848,7 @@ ${product.name}
 ${product.description}`
     : ''
 
-  const fullPrompt = (prompt ?? '') + productContext
+  const fullPrompt = (prompt ?? '') + productContext + orchestrationGuard
   const history = await getHistory(dialogId)
   const llmText = buildLLMUserText(text, incomingMessage)
 
@@ -842,11 +876,22 @@ ${product.description}`
   await saveTokens({ userId, dialogId, inputTokens, outputTokens, usedModel })
   await markReplied(incomingMessageId)
 
+  const nextActionPatch = maybePushNextActionAt(dialog)
+
+  if (nextActionPatch.next_action_at) {
+    await trace(traceId, 'router.product_cycle_rescheduled', {
+      dialog_id: dialogId,
+      old_next_action_at: dialog.next_action_at,
+      new_next_action_at: nextActionPatch.next_action_at,
+    })
+  }
+
   await updateDialog(dialogId, {
     message_count: (dialog.message_count ?? 0) + 1,
     last_message_at: new Date().toISOString(),
     last_message_by: 'bot',
     status_id: 6,
+    ...nextActionPatch,
   })
 
   await maybeSendMessage({
@@ -854,7 +899,7 @@ ${product.description}`
     text: reply,
     traceId,
     statusId: 6,
-    extra: { prompt_id: 5, product_id: dialog.product_id ?? 1 },
+    extra: { prompt_id: 5, product_id: productId },
   })
 }
 
@@ -896,7 +941,7 @@ async function handleStatus7({ dialog, userId, text, userContext, incomingMessag
     message_count: (dialog.message_count ?? 0) + 1,
     last_message_at: new Date().toISOString(),
     last_message_by: 'bot',
-    status_id: 3,
+    status_id: 7,
   })
 
   await maybeSendMessage({
