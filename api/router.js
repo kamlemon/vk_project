@@ -605,6 +605,22 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
     }
 
     const dealId = `vk-${dialogId}-${Date.now()}`
+    await trace(traceId, 'router.getplatinum_payment_payload_preview', {
+      dialog_id: dialogId,
+      deal_id: dealId,
+      amount,
+      currency: 'RUB',
+      client_id: `vk-${userId}`,
+      email,
+      phone,
+      notification_url: notificationUrl,
+      success_url: successUrl,
+      fail_url: failUrl,
+      position_prefix: 9,
+      position_prefix_type: typeof 9,
+      vat: 'none',
+    })
+
     const init = await initPaymentUrl({
       dealId,
       amount,
@@ -623,6 +639,8 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
         productId: 1,
         source: 'vk_bot',
       },
+      positionPrefix: 9,
+      vat: 'none',
     })
 
     await trace(traceId, 'router.getplatinum_payment_link_created', {
