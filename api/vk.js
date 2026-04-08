@@ -180,7 +180,21 @@ async function transcribeAttachment(parsed) {
       const base64 = Buffer.from(buf).toString('base64')
       parts = [
         { inline_data: { mime_type: 'image/jpeg', data: base64 } },
-        { text: 'Опиши детально что изображено на фото. Отвечай на русском языке.' },
+        { text: `Проверь, подходит ли это изображение для анализа ладони. Ответь строго на русском в формате:
+verdict: palm | not_palm | unclear
+quality: good | medium | poor
+visible_palm: yes | no
+visible_lines: yes | partly | no
+summary: ...
+details: ...
+
+Правила:
+- palm — если хорошо видна раскрытая ладонь со стороны линий.
+- not_palm — если на фото не ладонь, не та сторона руки или другой объект.
+- unclear — если ладонь есть, но качество, свет, ракурс или кадр мешают читать линии.
+- Не выдумывай детали, которых не видно.
+- Если verdict=unclear, напиши, что всё же удалось разобрать.
+- Если verdict=palm, отдельно укажи, какие основные линии различимы: жизни, сердца, ума, судьбы.` },
       ]
     } else if (types.includes('doc') && parsed._doc_url) {
       const mimeMap = { pdf: 'application/pdf', doc: 'application/msword', docx: 'application/msword', txt: 'text/plain' }

@@ -58,6 +58,37 @@ function buildFullPrompt(prompt, productDescription = null) {
   ].filter(Boolean).join('\n\n')
 }
 
+function buildPalmPhotoGuard(incomingMessage) {
+  const attachmentTypes = String(incomingMessage?.attachment_types ?? '')
+  if (!attachmentTypes.includes('photo')) return ''
+
+  return `
+
+Дополнительные правила для фото ладони:
+- Если в "Описание вложения от системы" есть verdict: not_palm, значит это не ладонь или ладонь не видна со стороны линий. В таком случае не делай диагностику, не выдумывай линии и не ставь ${DIAGNOSIS_MARKER}. Коротко скажи, что на фото не ладонь, и попроси прислать фото раскрытой ладони целиком.
+- Если в "Описание вложения от системы" есть verdict: unclear, значит ладонь видна недостаточно хорошо. В таком случае не делай полный анализ и не ставь ${DIAGNOSIS_MARKER}. Скажи, что качество или ракурс слабые, коротко перечисли, что всё же удалось разобрать по описанию, и попроси более чёткое фото.
+- Делай полноценный анализ ладони только если в описании есть verdict: palm и видимые линии.
+- Не придумывай линии и детали, которых нет в описании.`
+}
+
+function hasCompletedPaidCycle(dialog) {
+  return Boolean(dialog?.cycle_completed_at)
+}
+
+function buildPostProductSalesGuard(dialog) {
+  if (!hasCompletedPaidCycle(dialog)) return ''
+
+  return `
+
+Контекст продажи:
+- Клиент уже завершил предыдущую платную практику.
+- Нельзя продавать ему этот же продукт повторно как следующий шаг по умолчанию.
+- Твоя задача теперь — мягкий cross-sell: сначала уточни, что он хочет усилить сейчас: деньги, отношения, реализацию или состояние.
+- После этого предложи следующий релевантный продукт или направление, опираясь на историю диалога.
+- Не отправляй ссылку на оплату и не обещай её, пока клиент не подтвердил интерес к следующему продукту.
+- Не описывай это как повтор прошлой практики.`
+}
+
 
 async function getStaticPrompt(promptId) {
   const { data } = await supabase
@@ -355,7 +386,7 @@ async function handleStatus12({ dialog, userId, text, userContext, incomingMessa
 
   const prompt = await getPrompt(1)
   const productDescription = await getProduct(1)
-  const fullPrompt = buildFullPrompt(prompt, productDescription)
+  const fullPrompt = buildFullPrompt(prompt, productDescription) + buildPalmPhotoGuard(incomingMessage)
   const history = await getHistory(dialogId)
   const llmText = buildLLMUserText(text, incomingMessage)
 
@@ -457,7 +488,7 @@ async function handleStatus3({
       dialog_id: dialog.id,
       status_id: 3,
       prompt_id: 2,
-      system_prompt: prompt,
+      system_prompt: fullPrompt,
       user_context: userContext,
       history,
       user_message: llmText,
@@ -598,6 +629,37 @@ async function handleStatus4({ dialog, userId, incomingMessageId, traceId }) {
 
 function isPaymentLinkRequest(text) {
   return PAYMENT_LINK_TRIGGER_RE.test((text ?? '').trim())
+}
+
+async function handleStatus5PostProductQualification({ dialog, userId, firstName, incomingMessageId, traceId }) {
+  const dialogId = dialog.id
+  const name = (firstName ?? 'Клиент').trim() || 'Клиент'
+  const reply = `${name}, прошлую практику мы уже завершили. Чтобы я не отправила тебе тот же шаг повторно, давай сначала уточним, что сейчас для тебя важнее всего: деньги, отношения, реализация или внутреннее состояние. Напиши одно направление — и я подберу следующий продукт под твой запрос.`
+
+  await saveReply({
+    dialogId,
+    userId,
+    reply,
+    usedModel: 'system-cross-sell',
+    replyToId: incomingMessageId,
+  })
+
+  await markReplied(incomingMessageId)
+
+  await updateDialog(dialogId, {
+    status_id: 5,
+    message_count: (dialog.message_count ?? 0) + 1,
+    last_message_at: new Date().toISOString(),
+    last_message_by: 'bot',
+  })
+
+  await maybeSendMessage({
+    userId,
+    text: reply,
+    traceId,
+    statusId: 5,
+    extra: { prompt_id: 'post_product_cross_sell_gate' },
+  })
 }
 
 async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMessageId, traceId }) {
@@ -762,6 +824,16 @@ async function handleStatus5({ dialog, userId, text, userContext, incomingMessag
   const dialogId = dialog.id
 
   if (isPaymentLinkRequest(text)) {
+    if (hasCompletedPaidCycle(dialog)) {
+      return await handleStatus5PostProductQualification({
+        dialog,
+        userId,
+        firstName,
+        incomingMessageId,
+        traceId,
+      })
+    }
+
     return await handleStatus5PaymentLink({
       dialog,
       userId,
@@ -773,6 +845,7 @@ async function handleStatus5({ dialog, userId, text, userContext, incomingMessag
 
   const incomingMessage = await getIncomingMessage(incomingMessageId)
   const prompt = await getPrompt(4)
+  const fullPrompt = (prompt ?? '') + buildPostProductSalesGuard(dialog)
   const history = await getHistory(dialogId)
   const llmText = buildLLMUserText(text, incomingMessage)
 
@@ -787,7 +860,7 @@ async function handleStatus5({ dialog, userId, text, userContext, incomingMessag
   })
 
   const { reply, inputTokens, outputTokens, model: usedModel } =
-    await callLLM({ prompt, userContext, history, text: llmText, source: 'status-5' })
+    await callLLM({ prompt: fullPrompt, userContext, history, text: llmText, source: 'status-5' })
 
   await trace(traceId, 'router.deepseek_response', {
     reply,
