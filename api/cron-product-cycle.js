@@ -35,7 +35,6 @@ async function getDialogsForCycle() {
     .select('id, vk_user_id, status_id, product_id, product_step, next_action_at, cycle_started_at, cycle_completed_at, message_count')
     .eq('status_id', 6)
     .is('cycle_completed_at', null)
-    .not('next_action_at', 'is', null)
     .limit(100)
 
   if (error) throw error
@@ -53,7 +52,35 @@ async function getFirstName(vkUserId) {
   return data?.first_name ?? 'Клиент'
 }
 
-async function saveReply({ dialogId, userId, reply, step }) {
+async function getLatestOutboundText(dialogId) {
+  const { data, error } = await supabase
+    .from('message')
+    .select('text, msg_date')
+    .eq('dialog_id', dialogId)
+    .eq('direction', 'out')
+    .order('msg_date', { ascending: false })
+    .limit(3)
+
+  if (error) throw error
+  return data?.[0]?.text ?? ''
+}
+
+function inferLegacyStep(text) {
+  const normalized = String(text ?? '').toLowerCase()
+
+  if (
+    normalized.includes('этап 2') ||
+    normalized.includes('финальной практик') ||
+    normalized.includes('напишу тебе') ||
+    normalized.includes('осталось совсем немного')
+  ) {
+    return 2
+  }
+
+  return 1
+}
+
+async function saveReply({ dialogId, userId, reply, step, productId }) {
   const { error } = await supabase.from('message').insert({
     dialog_id: dialogId,
     from_id: userId,
@@ -64,7 +91,7 @@ async function saveReply({ dialogId, userId, reply, step }) {
     reply_to_id: null,
     raw_json: {
       source: 'cron-product-cycle',
-      product_id: PAID_PRODUCT_ID,
+      product_id: productId,
       product_step: step,
     },
   })
@@ -86,18 +113,32 @@ export default async function handler(req, res) {
     const skipped = []
 
     for (const dialog of dialogs) {
-      const dueAt = new Date(dialog.next_action_at)
+      const productId = Number(dialog.product_id ?? PAID_PRODUCT_ID) || PAID_PRODUCT_ID
+
+      let step = Number(dialog.product_step ?? 0)
+      let dueAt = dialog.next_action_at ? new Date(dialog.next_action_at) : now
+      let legacyDetected = false
+
+      if (!step) {
+        const latestOutboundText = await getLatestOutboundText(dialog.id)
+        step = inferLegacyStep(latestOutboundText)
+        legacyDetected = true
+      }
+
       if (Number.isNaN(dueAt.getTime())) {
-        skipped.push({ dialog_id: dialog.id, reason: 'invalid_next_action_at', value: dialog.next_action_at })
-        continue
+        dueAt = now
       }
 
       if (now < dueAt) {
-        skipped.push({ dialog_id: dialog.id, reason: 'waiting', next_action_at: dialog.next_action_at })
+        skipped.push({
+          dialog_id: dialog.id,
+          reason: 'waiting',
+          next_action_at: dialog.next_action_at,
+          product_step: step,
+        })
         continue
       }
 
-      const step = Number(dialog.product_step ?? 1)
       const firstName = await getFirstName(dialog.vk_user_id)
       const reply = getStepMessage({ firstName, step })
 
@@ -106,22 +147,27 @@ export default async function handler(req, res) {
         userId: dialog.vk_user_id,
         reply,
         step,
+        productId,
       })
 
       await sendMessage(dialog.vk_user_id, reply)
 
       const patch = step === 1
         ? {
+            product_id: productId,
             product_step: 2,
             next_action_at: plusMinutesIso(PRODUCT_CYCLE_DELAY_MINUTES),
+            cycle_started_at: dialog.cycle_started_at ?? now.toISOString(),
             last_message_at: now.toISOString(),
             last_message_by: 'bot',
             message_count: (dialog.message_count ?? 0) + 1,
             status_id: 6,
           }
         : {
+            product_id: productId,
             product_step: 3,
             next_action_at: null,
+            cycle_started_at: dialog.cycle_started_at ?? now.toISOString(),
             cycle_completed_at: now.toISOString(),
             last_message_at: now.toISOString(),
             last_message_by: 'bot',
@@ -143,6 +189,7 @@ export default async function handler(req, res) {
         new_status_id: patch.status_id,
         new_product_step: patch.product_step,
         next_action_at: patch.next_action_at ?? null,
+        legacy_detected: legacyDetected,
       })
 
       sent.push({
@@ -151,6 +198,7 @@ export default async function handler(req, res) {
         previous_step: step,
         new_status_id: patch.status_id,
         new_product_step: patch.product_step,
+        legacy_detected: legacyDetected,
       })
     }
 
