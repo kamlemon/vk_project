@@ -106,8 +106,6 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  const debug = String(req.query?.debug ?? '') === '1'
-  const dryRun = String(req.query?.dry ?? '') === '1'
   const traceId = `cron-product-cycle-${Date.now()}`
   const now = new Date()
 
@@ -115,7 +113,6 @@ export default async function handler(req, res) {
     const dialogs = await getDialogsForCycle()
     const sent = []
     const skipped = []
-    const inspected = []
 
     for (const dialog of dialogs) {
       const productId = Number(dialog.product_id ?? PAID_PRODUCT_ID) || PAID_PRODUCT_ID
@@ -136,46 +133,12 @@ export default async function handler(req, res) {
         dueAt = now
       }
 
-      const dueNow = now >= dueAt
-
-      inspected.push({
-        dialog_id: dialog.id,
-        vk_user_id: dialog.vk_user_id,
-        status_id: dialog.status_id,
-        product_id: dialog.product_id,
-        product_id_effective: productId,
-        product_step_raw: dialog.product_step,
-        product_step_effective: step,
-        next_action_at: dialog.next_action_at,
-        due_now: dueNow,
-        cycle_started_at: dialog.cycle_started_at,
-        cycle_completed_at: dialog.cycle_completed_at,
-        last_message_at: dialog.last_message_at,
-        last_message_by: dialog.last_message_by,
-        message_count: dialog.message_count,
-        legacy_detected: legacyDetected,
-        latest_outbound_preview: latestOutboundText.slice(0, 240),
-      })
-
-      if (!dueNow) {
+      if (now < dueAt) {
         skipped.push({
           dialog_id: dialog.id,
           reason: 'waiting',
           product_step: step,
           next_action_at: dialog.next_action_at,
-          legacy_detected: legacyDetected,
-        })
-        continue
-      }
-
-      if (dryRun) {
-        sent.push({
-          dialog_id: dialog.id,
-          user_id: dialog.vk_user_id,
-          previous_step: step,
-          would_send: true,
-          would_set_status_id: step === 1 ? 6 : 7,
-          would_set_product_step: step === 1 ? 2 : 3,
           legacy_detected: legacyDetected,
         })
         continue
@@ -245,8 +208,6 @@ export default async function handler(req, res) {
     }
 
     await trace(traceId, 'cron.product_cycle_done', {
-      debug,
-      dry_run: dryRun,
       dialogs_seen: dialogs.length,
       sent_count: sent.length,
       skipped_count: skipped.length,
@@ -254,12 +215,8 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       ok: true,
-      debug,
-      dry_run: dryRun,
-      dialogs_seen: dialogs.length,
       sent,
       skipped,
-      inspected: debug ? inspected : undefined,
     })
   } catch (err) {
     await trace(traceId, 'cron.product_cycle_failed', { error: err.message }, 'error')
