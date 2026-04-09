@@ -1,18 +1,4 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "cleanUrls": true,
-  "crons": [
-    {
-      "path": "/api/cron-product-cycle",
-      "schedule": "* * * * *"
-    },
-    {
-      "path": "/api/cron-offers",
-      "schedule": "* * * * *"
-    },
-    {
-      "path": "/api/cron-pending-replies",
-      "schedule": "* * * * *"
-    }
-  ]
+  "cleanUrls": true
 }
