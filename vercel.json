@@ -5,6 +5,14 @@
     {
       "path": "/api/cron-product-cycle",
       "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/cron-offers",
+      "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/cron-pending-replies",
+      "schedule": "* * * * *"
     }
   ]
 }

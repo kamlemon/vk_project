@@ -354,32 +354,15 @@ export default async function handler(req, res) {
       return res.status(200).send('ok')
     }
 
-    const text = msg.text ?? ''
-    const { data: userRow } = await supabase
-      .from('user')
-      .select('first_name, sex')
-      .eq('vk_user_id', vk_user_id)
-      .maybeSingle()
-
-    const fakeReq = {
-      method: 'POST',
-      body: {
-        user_id:             vk_user_id,
-        text,
-        first_name:          userRow?.first_name ?? null,
-        sex:                 userRow?.sex ?? null,
-        incoming_message_id: savedMessage.id,
-        trace_id:            traceId,
-        event_id:            body?.event_id ?? null,
-      },
-    }
-    const fakeRes = { status: () => ({ end: () => {}, send: () => {} }), send: () => {} }
-
     try {
-      const m = await import('../api/router.js')
-      await m.default(fakeReq, fakeRes)
+      await trace(traceId, 'vk.reply_queued', {
+        dialog_id: savedMessage?.dialog_id ?? null,
+        incoming_message_id: savedMessage?.id ?? null,
+        vk_user_id,
+        queue_window_seconds: Number(process.env.BATCH_WINDOW_SECONDS ?? 75),
+      })
     } catch (e) {
-      console.error('[handler] router error:', e.message)
+      console.error('[handler] queue trace error:', e.message)
     }
   }
 

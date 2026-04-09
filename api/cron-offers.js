@@ -1,109 +1,70 @@
 import { supabase } from '../lib/supabase.js'
-import { sendMessage } from '../lib/vk.js'
 import { trace } from '../lib/debug-trace.js'
-import { callDeepSeek } from '../lib/deepseek.js'
+import { sendMessage } from '../lib/vk.js'
 
-async function getStaticPrompt(promptId) {
+async function getPrompt3() {
   const { data, error } = await supabase
     .from('prompt')
     .select('prompt_content')
-    .eq('prompt_id', promptId)
+    .eq('prompt_id', 3)
     .eq('is_active', true)
+    .limit(1)
     .maybeSingle()
 
   if (error) throw error
-  return data?.prompt_content ?? null
+  if (!data?.prompt_content) throw new Error('Active prompt_id=3 not found')
+
+  return data.prompt_content
 }
 
-async function getMessagesAfterFree(dialogId, freeDoneAt) {
+async function getDueDialogs(nowIso) {
   const { data, error } = await supabase
-    .from('message')
-    .select('id, direction, text, attachment_trans, dt_create, is_replied')
-    .eq('dialog_id', dialogId)
-    .gt('dt_create', freeDoneAt)
-    .order('dt_create', { ascending: true })
+    .from('dialog')
+    .select('id, vk_user_id, status_id, message_count, prompt_3_scheduled_at, offer_sent_at')
+    .in('status_id', [3, 4])
+    .is('offer_sent_at', null)
+    .not('prompt_3_scheduled_at', 'is', null)
+    .lte('prompt_3_scheduled_at', nowIso)
+    .order('prompt_3_scheduled_at', { ascending: true })
+    .limit(100)
 
   if (error) throw error
   return data ?? []
 }
 
-function normalizeMessageContent(m) {
-  const text = (m.text ?? '').trim()
-
-  let trans = ''
-  if (Array.isArray(m.attachment_trans)) {
-    trans = m.attachment_trans.join('\n\n').trim()
-  } else if (typeof m.attachment_trans === 'string') {
-    trans = m.attachment_trans.trim()
-  }
-
-  if (text && trans) return `${text}\n\n[вложение]\n${trans}`
-  if (text) return text
-  if (trans) return `[вложение]\n${trans}`
-  return ''
-}
-
-function buildHistory(messages) {
-  return messages
-    .map(m => {
-      const content = normalizeMessageContent(m)
-      if (!content) return null
-
-      return {
-        role: m.direction === 'out' ? 'assistant' : 'user',
-        content,
-      }
-    })
-    .filter(Boolean)
-}
-
-async function saveReply({ dialogId, userId, reply, usedModel = 'static' }) {
-  const { error } = await supabase.from('message').insert({
-    dialog_id: dialogId,
-    from_id: userId,
-    peer_id: userId,
-    direction: 'out',
-    text: reply,
-    msg_date: new Date().toISOString(),
-    reply_to_id: null,
-    raw_json: { source: 'cron-offers', model: usedModel },
-  })
-
-  if (error) throw error
-}
-
-async function markIncomingAfterFreeReplied(dialogId, freeDoneAt) {
+async function saveOfferMessage(dialog, text, nowIso) {
   const { error } = await supabase
     .from('message')
-    .update({ is_replied: true })
-    .eq('dialog_id', dialogId)
-    .eq('direction', 'in')
-    .gt('dt_create', freeDoneAt)
+    .insert({
+      dialog_id: dialog.id,
+      from_id: dialog.vk_user_id,
+      peer_id: dialog.vk_user_id,
+      direction: 'out',
+      text,
+      msg_date: nowIso,
+      reply_to_id: null,
+      raw_json: {
+        source: 'cron-offers',
+        prompt_id: 3,
+      },
+    })
 
   if (error) throw error
 }
 
-async function buildWarmReply(history) {
-  const prompt = `Ты — Анна, таролог, хиромант и астролог.
-Клиент уже получил бесплатную диагностику.
-После неё он написал ещё сообщения, и тебе нужно коротко, тепло и по-человечески ответить на них перед следующим сообщением с услугами.
+async function updateDialogAfterOffer(dialog, nowIso) {
+  const { error } = await supabase
+    .from('dialog')
+    .update({
+      status_id: 5,
+      offer_sent_at: nowIso,
+      last_message_at: nowIso,
+      last_message_by: 'bot',
+      message_count: (dialog.message_count ?? 0) + 1,
+    })
+    .eq('id', dialog.id)
 
-Правила:
-- ответ короткий, 1-2 абзаца
-- покажи, что ты услышала клиента
-- не перечисляй услуги
-- не продавай в лоб
-- не задавай больше одного вопроса
-- не используй списки
-- стиль живой, спокойный, уверенный`
-
-  const userText = `Последние сообщения после бесплатной диагностики:\n\n${history
-    .filter(x => x.role === 'user')
-    .map(x => x.content)
-    .join('\n\n---\n\n')}`
-
-  const result = await callDeepSeek(prompt, '', history, userText)
-  return result
+  if (error) throw error
 }
 
 export default async function handler(req, res) {
@@ -112,124 +73,42 @@ export default async function handler(req, res) {
   }
 
   const traceId = `cron-offers-${Date.now()}`
-  const now = new Date()
+  const nowIso = new Date().toISOString()
 
   try {
-    const staticOffer = await getStaticPrompt(3)
-
-    if (!staticOffer) {
-      await trace(traceId, 'cron.offers_prompt_missing', { prompt_id: 3 }, 'error')
-      return res.status(500).json({ ok: false, error: 'prompt_3_not_found' })
-    }
-
-    const { data: dialogs, error } = await supabase
-      .from('dialog')
-      .select('id, vk_user_id, status_id, free_done_at, prompt_3_scheduled_at, offer_sent_at, message_count, user_message_count')
-      .eq('status_id', 4)
-      .is('offer_sent_at', null)
-      .not('prompt_3_scheduled_at', 'is', null)
-      .limit(100)
-
-    if (error) throw error
-
+    const prompt3 = await getPrompt3()
+    const dialogs = await getDueDialogs(nowIso)
     const sent = []
-    const skipped = []
 
-    for (const dialog of dialogs ?? []) {
-      const scheduledAt = new Date(dialog.prompt_3_scheduled_at)
+    for (const dialog of dialogs) {
+      await saveOfferMessage(dialog, prompt3, nowIso)
+      await sendMessage(dialog.vk_user_id, prompt3)
+      await updateDialogAfterOffer(dialog, nowIso)
 
-      if (now < scheduledAt) {
-        skipped.push({
-          dialog_id: dialog.id,
-          reason: 'waiting_prompt_3_timeout',
-          prompt_3_scheduled_at: dialog.prompt_3_scheduled_at,
-        })
-        continue
-      }
-
-      const freeDoneAt = dialog.free_done_at ?? dialog.prompt_3_scheduled_at
-      const messagesAfterFree = await getMessagesAfterFree(dialog.id, freeDoneAt)
-      const history = buildHistory(messagesAfterFree)
-
-      let warmReply = null
-      let warmReplyModel = null
-
-      if (history.some(x => x.role === 'user')) {
-        const warm = await buildWarmReply(history)
-        warmReply = (warm.reply ?? '').trim()
-        warmReplyModel = warm.model ?? 'deepseek-chat'
-      }
-
-      if (warmReply) {
-        await saveReply({
-          dialogId: dialog.id,
-          userId: dialog.vk_user_id,
-          reply: warmReply,
-          usedModel: warmReplyModel,
-        })
-
-        await sendMessage(dialog.vk_user_id, warmReply)
-
-        await trace(traceId, 'cron.offer_warm_reply_sent', {
-          dialog_id: dialog.id,
-          user_id: dialog.vk_user_id,
-          model: warmReplyModel,
-          text_preview: warmReply.slice(0, 300),
-        })
-      }
-
-      await saveReply({
-        dialogId: dialog.id,
-        userId: dialog.vk_user_id,
-        reply: staticOffer,
-        usedModel: 'static_prompt_3',
+      await trace(traceId, 'cron.offer_sent', {
+        dialog_id: dialog.id,
+        vk_user_id: dialog.vk_user_id,
+        previous_status_id: dialog.status_id,
+        new_status_id: 5,
       })
-
-      await sendMessage(dialog.vk_user_id, staticOffer)
-
-      await markIncomingAfterFreeReplied(dialog.id, freeDoneAt)
-
-      const botMessagesAdded = warmReply ? 2 : 1
-
-      const { error: updErr } = await supabase
-        .from('dialog')
-        .update({
-          status_id: 5,
-          offer_sent_at: now.toISOString(),
-          last_message_at: now.toISOString(),
-          last_message_by: 'bot',
-          message_count: (dialog.message_count ?? 0) + botMessagesAdded,
-        })
-        .eq('id', dialog.id)
-
-      if (updErr) throw updErr
 
       sent.push({
         dialog_id: dialog.id,
-        user_id: dialog.vk_user_id,
-        warm_reply_sent: Boolean(warmReply),
-        offer_sent: true,
+        vk_user_id: dialog.vk_user_id,
+        previous_status_id: dialog.status_id,
+        new_status_id: 5,
       })
     }
 
     await trace(traceId, 'cron.offers_done', {
+      dialogs_seen: dialogs.length,
+      sent_count: sent.length,
       sent,
-      skipped,
     })
 
-    return res.status(200).json({
-      ok: true,
-      sent,
-      skipped,
-    })
+    return res.status(200).json({ ok: true, sent })
   } catch (err) {
-    await trace(traceId, 'cron.offers_failed', {
-      error: err.message,
-    }, 'error')
-
-    return res.status(500).json({
-      ok: false,
-      error: err.message,
-    })
+    await trace(traceId, 'cron.offers_failed', { error: err.message }, 'error')
+    return res.status(500).json({ ok: false, error: err.message })
   }
 }

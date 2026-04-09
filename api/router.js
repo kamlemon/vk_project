@@ -83,9 +83,9 @@ function buildPostProductSalesGuard(dialog) {
 Контекст продажи:
 - Клиент уже завершил предыдущую платную практику.
 - Нельзя продавать ему этот же продукт повторно как следующий шаг по умолчанию.
-- Твоя задача теперь — мягкий cross-sell: сначала уточни, что он хочет усилить сейчас: деньги, отношения, реализацию или состояние.
-- После этого предложи следующий релевантный продукт или направление, опираясь на историю диалога.
-- Не отправляй ссылку на оплату и не обещай её, пока клиент не подтвердил интерес к следующему продукту.
+- Твоя задача теперь — мягкий cross-sell: помоги выбрать следующее направление из вариантов: деньги, отношения, реализация, состояние.
+- Если клиент уже назвал направление, предложи следующий релевантный продукт или формат работы под этот запрос.
+- Не отправляй ссылку на оплату сразу после первого же запроса на ссылку. Сначала уточни направление или подтверди, какой следующий продукт ему подходит.
 - Не описывай это как повтор прошлой практики.`
 }
 
@@ -823,17 +823,9 @@ ${init.formUrl}
 async function handleStatus5({ dialog, userId, text, userContext, incomingMessageId, traceId, firstName }) {
   const dialogId = dialog.id
 
-  if (isPaymentLinkRequest(text)) {
-    if (hasCompletedPaidCycle(dialog)) {
-      return await handleStatus5PostProductQualification({
-        dialog,
-        userId,
-        firstName,
-        incomingMessageId,
-        traceId,
-      })
-    }
+  const isPostProductPaymentIntent = hasCompletedPaidCycle(dialog) && isPaymentLinkRequest(text)
 
+  if (isPaymentLinkRequest(text) && !hasCompletedPaidCycle(dialog)) {
     return await handleStatus5PaymentLink({
       dialog,
       userId,
@@ -845,7 +837,17 @@ async function handleStatus5({ dialog, userId, text, userContext, incomingMessag
 
   const incomingMessage = await getIncomingMessage(incomingMessageId)
   const prompt = await getPrompt(4)
-  const fullPrompt = (prompt ?? '') + buildPostProductSalesGuard(dialog)
+  const fullPrompt =
+    (prompt ?? '') +
+    buildPostProductSalesGuard(dialog) +
+    (isPostProductPaymentIntent
+      ? `
+
+Дополнительный контекст:
+- Клиент прямо попросил ссылку или оплату после завершения прошлого продукта.
+- Не отправляй ссылку сразу.
+- Сначала коротко уточни, что он хочет усилить сейчас, либо если направление уже ясно из текста, предложи следующий продукт под это направление.`
+      : '')
   const history = await getHistory(dialogId)
   const llmText = buildLLMUserText(text, incomingMessage)
 
