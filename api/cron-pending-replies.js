@@ -14,8 +14,27 @@ function groupByDialog(rows) {
   return map
 }
 
+function pickRepresentativeMessage(rows) {
+  const withAttachments = rows.filter(row =>
+    row.has_attachments ||
+    (Array.isArray(row.attachment_trans) && row.attachment_trans.length > 0) ||
+    (!!row.attachment_trans && !Array.isArray(row.attachment_trans)) ||
+    !!row.attachment_types
+  )
+
+  return withAttachments.length
+    ? withAttachments[withAttachments.length - 1]
+    : rows[rows.length - 1]
+}
+
 function buildCombinedText(rows) {
-  return rows.map((row, idx) => {
+  const intro = `Техническая заметка:
+- это продолжение уже начатого диалога
+- не здоровайся повторно
+- не начинай разговор заново
+- отвечай сразу по сути последних сообщений пользователя`
+
+  const body = rows.map((row, idx) => {
     const chunks = []
     chunks.push(`Сообщение ${idx + 1}: ${row.text?.trim() || '[без текста]'}`)
 
@@ -35,6 +54,8 @@ function buildCombinedText(rows) {
 
     return chunks.join('\n')
   }).join('\n\n')
+
+  return `${intro}\n\n${body}`
 }
 
 async function getPendingInboundMessages() {
@@ -61,7 +82,7 @@ async function getUser(vkUserId) {
   return data ?? { first_name: null, sex: null }
 }
 
-async function markOlderMessagesReplied(messageIds) {
+async function markMessagesReplied(messageIds) {
   if (!messageIds.length) return
 
   const { error } = await supabase
@@ -112,6 +133,7 @@ export default async function handler(req, res) {
         continue
       }
 
+      const representative = pickRepresentativeMessage(items)
       const combinedText = buildCombinedText(items)
       const user = await getUser(latest.from_id)
 
@@ -122,7 +144,7 @@ export default async function handler(req, res) {
           text: combinedText,
           first_name: user?.first_name ?? null,
           sex: user?.sex ?? null,
-          incoming_message_id: latest.id,
+          incoming_message_id: representative.id,
           trace_id: `${traceId}-dialog-${dialogId}`,
           event_id: `batched-${dialogId}-${latest.id}`,
         },
@@ -131,20 +153,25 @@ export default async function handler(req, res) {
       await trace(traceId, 'cron.pending_replies_dispatch', {
         dialog_id: dialogId,
         latest_message_id: latest.id,
+        representative_message_id: representative.id,
         batch_size: items.length,
         message_ids: items.map(x => x.id),
       })
 
       await routerHandler(fakeReq, makeFakeRes())
 
-      const olderIds = items.slice(0, -1).map(x => x.id)
-      await markOlderMessagesReplied(olderIds)
+      const otherIds = items
+        .filter(x => x.id !== representative.id)
+        .map(x => x.id)
+
+      await markMessagesReplied(otherIds)
 
       processed.push({
         dialog_id: dialogId,
         latest_message_id: latest.id,
+        representative_message_id: representative.id,
         batch_size: items.length,
-        older_marked_replied: olderIds,
+        other_marked_replied: otherIds,
       })
     }
 

@@ -71,6 +71,19 @@ function buildPalmPhotoGuard(incomingMessage) {
 - Не придумывай линии и детали, которых нет в описании.`
 }
 
+function buildNoRepeatGreetingGuard(history) {
+  const hasAssistantHistory = Array.isArray(history) && history.some(item => item.role === 'assistant')
+
+  if (!hasAssistantHistory) return ''
+
+  return `
+
+Правило продолжения диалога:
+- Диалог уже начат, поэтому не здоровайся повторно.
+- Не пиши "привет", "приветствую", "рада тебя видеть" и подобные фразы.
+- Сразу отвечай по сути последнего вопроса пользователя.`
+}
+
 function hasCompletedPaidCycle(dialog) {
   return Boolean(dialog?.cycle_completed_at)
 }
@@ -386,8 +399,11 @@ async function handleStatus12({ dialog, userId, text, userContext, incomingMessa
 
   const prompt = await getPrompt(1)
   const productDescription = await getProduct(1)
-  const fullPrompt = buildFullPrompt(prompt, productDescription) + buildPalmPhotoGuard(incomingMessage)
   const history = await getHistory(dialogId)
+  const fullPrompt =
+    buildFullPrompt(prompt, productDescription) +
+    buildPalmPhotoGuard(incomingMessage) +
+    buildNoRepeatGreetingGuard(history)
   const llmText = buildLLMUserText(text, incomingMessage)
 
   await trace(traceId, 'router.deepseek_payload', {
