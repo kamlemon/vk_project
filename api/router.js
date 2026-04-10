@@ -102,6 +102,96 @@ function buildPostProductSalesGuard(dialog) {
 - Не описывай это как повтор прошлой практики.`
 }
 
+function buildPaymentLinkMarkerGuard() {
+  return `
+
+Техническое правило оплаты:
+- Если клиент явно просит прислать ссылку на оплату, готов платить, хочет оплатить или подтверждает покупку уже выбранной практики, добавь В САМОМ КОНЦЕ ответа отдельной строкой маркер:
+[SEND_PAYMENT_LINK]
+offer_name: <краткое название выбранной практики>
+
+- Используй маркер только если уже понятно, какую именно практику клиент хочет купить.
+- Никогда не пиши фейковые конструкции вроде "[ссылка будет здесь]" или "[ссылка на оплату]".
+- Никогда не вставляй саму ссылку текстом — ссылку отправит система.
+- Если практика ещё не выбрана, сначала уточни, что именно клиент хочет купить, и не добавляй маркер.`
+}
+
+function extractPaymentLinkDecision(reply) {
+  const text = String(reply ?? '')
+  const hasMarker = text.includes('[SEND_PAYMENT_LINK]')
+  const offerMatch = text.match(/offer_name:\s*(.+)/i)
+
+  const cleaned = text
+    .replace(/\[SEND_PAYMENT_LINK\]/gi, '')
+    .replace(/offer_name:\s*.+/gi, '')
+    .replace(/\[ссылка.*?\]/gi, '')
+    .trim()
+
+  return {
+    shouldSend: hasMarker,
+    offerName: offerMatch?.[1]?.trim() || null,
+    cleanedReply: cleaned,
+  }
+}
+
+function formatRubFromMinor(amountMinor) {
+  const rub = Number(amountMinor ?? 0) / 100
+  if (Number.isInteger(rub)) return `${rub} ₽`
+  return `${rub.toFixed(2).replace('.', ',')} ₽`
+}
+
+function isReadyToStartMessage(text) {
+  const t = String(text ?? '').toLowerCase()
+  return /\b(готов|готова|готов начать|готова начать|давай начн[её]м|можно начинать|начинаем|поехали)\b/.test(t)
+}
+
+function parseJsonMaybe(value) {
+  if (!value) return null
+  if (typeof value === 'object') return value
+  try {
+    return JSON.parse(value)
+  } catch {
+    return null
+  }
+}
+
+async function getLatestPaidOfferMeta(dialogId) {
+  const { data, error } = await supabase
+    .from('payment')
+    .select('raw_callback, raw_init, created_at')
+    .eq('dialog_id', dialogId)
+    .eq('status', 'paid')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  if (error) throw error
+  if (!data) return { offerName: null }
+
+  const callback = parseJsonMaybe(data.raw_callback)
+  const init = parseJsonMaybe(data.raw_init)
+
+  return {
+    offerName:
+      callback?.customParams?.offerName
+      ?? init?.customParams?.offerName
+      ?? null,
+  }
+}
+
+function buildGenericPaidPrompt(offerName) {
+  return `Ты — Анна, таролог, хиромант и астролог. Человек оплатил практику "${offerName || 'выбранная практика'}", и ты сопровождаешь его в процессе.
+
+Тебе доступна вся история переписки.
+
+Правила:
+- Не подменяй название практики на другую.
+- Не говори про финансовый поток, если клиент купил не финансовую практику.
+- Поддерживай человека спокойно и по делу.
+- Если клиент спрашивает, когда старт, а работа ещё не начата, мягко напомни, что старт будет после его подтверждения готовности.
+- Не обещай автоматический следующий шаг, если цикл ещё не запущен.`
+}
+
 
 async function getStaticPrompt(promptId) {
   const { data } = await supabase
@@ -678,9 +768,11 @@ async function handleStatus5PostProductQualification({ dialog, userId, firstName
   })
 }
 
-async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMessageId, traceId }) {
+async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMessageId, traceId, offerName = null, prefaceText = null }) {
   const dialogId = dialog.id
   const amount = TEST_PAYMENT_AMOUNT
+  const amountLabel = formatRubFromMinor(amount)
+  const offerLabel = (offerName ?? '').trim() || 'выбранной практики'
   const email = process.env.GETPLATINUM_TEST_EMAIL ?? null
   const phone = process.env.GETPLATINUM_TEST_PHONE ?? null
   const notificationUrl = process.env.GETPLATINUM_NOTIFICATION_URL ?? null
@@ -718,7 +810,7 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
       dealId,
       amount,
       currency: 'RUB',
-      title: 'Тестовая оплата настройки финансового потока',
+      title: `Тестовая оплата: ${offerLabel}`,
       clientId: `vk-${userId}`,
       email,
       phone,
@@ -730,6 +822,7 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
         dialogId,
         vkUserId: userId,
         productId: PAID_PRODUCT_ID,
+        offerName: offerLabel,
         source: 'vk_bot',
       },
       positionPrefix: 9,
@@ -839,31 +932,12 @@ ${init.formUrl}
 async function handleStatus5({ dialog, userId, text, userContext, incomingMessageId, traceId, firstName }) {
   const dialogId = dialog.id
 
-  const isPostProductPaymentIntent = hasCompletedPaidCycle(dialog) && isPaymentLinkRequest(text)
-
-  if (isPaymentLinkRequest(text) && !hasCompletedPaidCycle(dialog)) {
-    return await handleStatus5PaymentLink({
-      dialog,
-      userId,
-      firstName,
-      incomingMessageId,
-      traceId,
-    })
-  }
-
   const incomingMessage = await getIncomingMessage(incomingMessageId)
   const prompt = await getPrompt(4)
   const fullPrompt =
     (prompt ?? '') +
     buildPostProductSalesGuard(dialog) +
-    (isPostProductPaymentIntent
-      ? `
-
-Дополнительный контекст:
-- Клиент прямо попросил ссылку или оплату после завершения прошлого продукта.
-- Не отправляй ссылку сразу.
-- Сначала коротко уточни, что он хочет усилить сейчас, либо если направление уже ясно из текста, предложи следующий продукт под это направление.`
-      : '')
+    buildPaymentLinkMarkerGuard()
   const history = await getHistory(dialogId)
   const llmText = buildLLMUserText(text, incomingMessage)
 
@@ -887,7 +961,24 @@ async function handleStatus5({ dialog, userId, text, userContext, incomingMessag
     model: usedModel,
   })
 
-  await saveReply({ dialogId, userId, reply, usedModel, replyToId: incomingMessageId })
+  const paymentDecision = extractPaymentLinkDecision(reply)
+  const shouldSendLink =
+    paymentDecision.shouldSend ||
+    (isPaymentLinkRequest(text) && !hasCompletedPaidCycle(dialog))
+
+  if (shouldSendLink) {
+    return await handleStatus5PaymentLink({
+      dialog,
+      userId,
+      firstName,
+      incomingMessageId,
+      traceId,
+      offerName: paymentDecision.offerName,
+      prefaceText: paymentDecision.cleanedReply || 'Отправляю ссылку на оплату.',
+    })
+  }
+
+  await saveReply({ dialogId, userId, reply: paymentDecision.cleanedReply || reply, usedModel, replyToId: incomingMessageId })
   await saveTokens({ userId, dialogId, inputTokens, outputTokens, usedModel })
   await markReplied(incomingMessageId)
 
@@ -912,15 +1003,44 @@ async function handleStatus5({ dialog, userId, text, userContext, incomingMessag
 async function handleStatus6({ dialog, userId, text, userContext, incomingMessageId, traceId }) {
   const dialogId = dialog.id
   const incomingMessage = await getIncomingMessage(incomingMessageId)
+  const paidOfferMeta = await getLatestPaidOfferMeta(dialogId)
+  const offerName = paidOfferMeta.offerName ?? null
+
+  if (!dialog.cycle_started_at) {
+    const ready = isReadyToStartMessage(text)
+
+    const reply = ready
+      ? `${userContext.includes('Имя клиента:') ? '' : ''}${offerName ? `Отлично, начинаю практику «${offerName}».` : 'Отлично, начинаю работу.'} Первый этап уже запущен. Следующий шаг пришлю сюда автоматически.`
+      : `${offerName ? `Вижу оплату за практику «${offerName}», спасибо большое.` : 'Вижу оплату, спасибо большое.'} Когда будешь готов начать, просто напиши мне сюда: «готов начать».`
+
+    await saveReply({ dialogId, userId, reply, usedModel: 'system-status-6', replyToId: incomingMessageId })
+    await markReplied(incomingMessageId)
+
+    await updateDialog(dialogId, {
+      message_count: (dialog.message_count ?? 0) + 1,
+      last_message_at: new Date().toISOString(),
+      last_message_by: 'bot',
+      status_id: 6,
+      product_step: ready ? 1 : 0,
+      cycle_started_at: ready ? new Date().toISOString() : null,
+      next_action_at: ready ? plusMinutesIso(PRODUCT_CYCLE_REPLY_GRACE_MINUTES + 2) : null,
+    })
+
+    await maybeSendMessage({
+      userId,
+      text: reply,
+      traceId,
+      statusId: 6,
+      extra: { prompt_id: ready ? 'status6_manual_start' : 'status6_wait_ready', offer_name: offerName },
+    })
+    return
+  }
 
   const prompt = await getPrompt(5)
-  const productId = dialog.product_id ?? PAID_PRODUCT_ID
-
-  const { data: product } = await supabase
-    .from('product')
-    .select('name, description')
-    .eq('product_id', productId)
-    .maybeSingle()
+  const basePrompt =
+    offerName && offerName !== 'Настройка финансового изобилия'
+      ? buildGenericPaidPrompt(offerName)
+      : prompt
 
   const orchestrationGuard = dialog.next_action_at && !dialog.cycle_completed_at
     ? `
@@ -930,16 +1050,7 @@ async function handleStatus6({ dialog, userId, text, userContext, incomingMessag
 
 Системное правило: не обещай, что сама напишешь позже, если следующий автошаг не запланирован системой.`
 
-  const productContext = product
-    ? `
-
-Продукт:
-${product.name}
-
-${product.description}`
-    : ''
-
-  const fullPrompt = (prompt ?? '') + productContext + orchestrationGuard
+  const fullPrompt = (basePrompt ?? '') + orchestrationGuard
   const history = await getHistory(dialogId)
   const llmText = buildLLMUserText(text, incomingMessage)
 
@@ -969,14 +1080,6 @@ ${product.description}`
 
   const nextActionPatch = maybePushNextActionAt(dialog)
 
-  if (nextActionPatch.next_action_at) {
-    await trace(traceId, 'router.product_cycle_rescheduled', {
-      dialog_id: dialogId,
-      old_next_action_at: dialog.next_action_at,
-      new_next_action_at: nextActionPatch.next_action_at,
-    })
-  }
-
   await updateDialog(dialogId, {
     message_count: (dialog.message_count ?? 0) + 1,
     last_message_at: new Date().toISOString(),
@@ -990,7 +1093,7 @@ ${product.description}`
     text: reply,
     traceId,
     statusId: 6,
-    extra: { prompt_id: 5, product_id: productId },
+    extra: { prompt_id: 5, offer_name: offerName },
   })
 }
 

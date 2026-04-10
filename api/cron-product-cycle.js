@@ -9,24 +9,22 @@ function plusMinutesIso(minutes) {
   return new Date(Date.now() + minutes * 60 * 1000).toISOString()
 }
 
-function getStepMessage({ firstName = 'Клиент', step }) {
+function getStepMessage({ firstName = 'Клиент', step, offerName = null }) {
+  const label = offerName ? `по практике «${offerName}»` : 'по твоей практике'
+
   if (step === 1) {
-    return `${firstName}, продолжаю работу.
+    return `${firstName}, продолжаю работу ${label}.
 
-Этап 2. Открытие финансового канала — запущен.
+Основной этап сейчас в процессе. Я уже иду в глубину по твоему запросу и собираю все ключевые точки, которые нужно проработать.
 
-Сейчас иду по центральной части жизненной линии и снимаю напряжение, которое мешает деньгам идти свободнее. На этом этапе лучше ничего специально не делать — просто быть в спокойном состоянии и не спорить мысленно с процессом.
-
-Ещё немного времени, и я вернусь с финальным закреплением.`
+Немного позже вернусь сюда со следующим шагом.`
   }
 
-  return `${firstName}, завершаю работу.
+  return `${firstName}, завершаю работу ${label}.
 
-Финальный этап. Закрепление практики — завершён.
+Основной этап практики завершён. Дальше важно спокойно понаблюдать за состоянием, реакциями и первыми изменениями в ближайшее время.
 
-Я зафиксировала результат по финансовому каналу и закрыла цикл практики. Дальше просто понаблюдай за тем, как в ближайшие дни начнут проявляться новые движения: предложения, возвраты, идеи, ощущение большей лёгкости в деньгах.
-
-Если захочешь, я могу сразу подобрать для тебя следующий шаг и предложить следующий продукт под твою текущую задачу. Напиши, что сейчас хочется усилить — деньги, отношения, реализацию или состояние.`
+Если захочешь потом описать, что изменилось по ощущениям или по факту, можешь написать мне сюда.`
 }
 
 async function getDialogsForCycle() {
@@ -51,6 +49,35 @@ async function getFirstName(vkUserId) {
 
   if (error) throw error
   return data?.first_name ?? 'Клиент'
+}
+
+function parseJsonMaybe(value) {
+  if (!value) return null
+  if (typeof value === 'object') return value
+  try {
+    return JSON.parse(value)
+  } catch {
+    return null
+  }
+}
+
+async function getLatestPaidOfferName(dialogId) {
+  const { data, error } = await supabase
+    .from('payment')
+    .select('raw_callback, raw_init, created_at')
+    .eq('dialog_id', dialogId)
+    .eq('status', 'paid')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  if (error) throw error
+  if (!data) return null
+
+  const callback = parseJsonMaybe(data.raw_callback)
+  const init = parseJsonMaybe(data.raw_init)
+
+  return callback?.customParams?.offerName ?? init?.customParams?.offerName ?? null
 }
 
 async function getLatestOutbound(dialogId) {
@@ -145,7 +172,8 @@ export default async function handler(req, res) {
       }
 
       const firstName = await getFirstName(dialog.vk_user_id)
-      const reply = getStepMessage({ firstName, step })
+      const offerName = await getLatestPaidOfferName(dialog.id)
+      const reply = getStepMessage({ firstName, step, offerName })
 
       await saveReply({
         dialogId: dialog.id,

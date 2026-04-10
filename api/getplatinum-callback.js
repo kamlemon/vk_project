@@ -4,11 +4,6 @@ import { verifyGetPlatinumChecksum } from '../lib/getplatinum.js'
 import { sendMessage } from '../lib/vk.js'
 
 const PAID_PRODUCT_ID = 2
-const PRODUCT_CYCLE_DELAY_MINUTES = Number(process.env.PRODUCT_CYCLE_DELAY_MINUTES ?? 5)
-
-function plusMinutesIso(minutes) {
-  return new Date(Date.now() + minutes * 60 * 1000).toISOString()
-}
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -94,7 +89,7 @@ export default async function handler(req, res) {
 
   if (notificationType === 1 && isSuccess) {
     const productId = Number(body?.customParams?.productId ?? PAID_PRODUCT_ID) || PAID_PRODUCT_ID
-    const nextActionAt = plusMinutesIso(PRODUCT_CYCLE_DELAY_MINUTES)
+    const offerName = body?.customParams?.offerName ?? null
 
     const { data: dialogBefore, error: dialogSelErr } = await supabase
       .from('dialog')
@@ -115,10 +110,10 @@ export default async function handler(req, res) {
       .update({
         status_id: 6,
         product_id: productId,
-        product_step: 1,
-        cycle_started_at: now,
+        product_step: 0,
+        cycle_started_at: null,
         cycle_completed_at: null,
-        next_action_at: nextActionAt,
+        next_action_at: null,
         last_message_at: now,
         last_message_by: 'bot',
         message_count: (dialogBefore?.message_count ?? 0) + 1,
@@ -137,11 +132,14 @@ export default async function handler(req, res) {
       dialog_id: payment.dialog_id,
       vk_user_id: payment.vk_user_id,
       product_id: productId,
-      product_step: 1,
-      next_action_at: nextActionAt,
+      product_step: 0,
+      next_action_at: null,
+      offer_name: offerName,
     })
 
-    const reply = 'Оплату вижу — всё прошло успешно. Начинаю практику по продукту прямо сейчас. Первый этап уже запущен, а следующий шаг я отправлю сюда автоматически.'
+    const reply = offerName
+      ? `Вижу оплату за практику «${offerName}», спасибо большое. Когда будешь готов начать, просто напиши мне сюда: «готов начать».`
+      : 'Вижу оплату, спасибо большое. Когда будешь готов начать, просто напиши мне сюда: «готов начать».'
 
     const { error: msgErr } = await supabase
       .from('message')
