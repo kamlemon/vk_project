@@ -106,7 +106,7 @@ function buildPaymentLinkMarkerGuard() {
   return `
 
 Техническое правило оплаты:
-- Если клиент явно просит прислать ссылку на оплату, готов платить, хочет оплатить или подтверждает покупку уже выбранной практики, добавь В САМОМ КОНЦЕ ответа отдельной строкой маркер:
+- Если клиент явно просит прислать ссылку на оплату, готов платить, хочет оплатить или подтверждает покупку уже выбранной практики, добавь В САМОМ КОНЦЕ ответа отдельной строкой маркер СТРОГО в таком виде:
 [SEND_PAYMENT_LINK]
 offer_name: <краткое название выбранной практики>
 
@@ -118,17 +118,22 @@ offer_name: <краткое название выбранной практики
 
 function extractPaymentLinkDecision(reply) {
   const text = String(reply ?? '')
-  const hasMarker = text.includes('[SEND_PAYMENT_LINK]')
-  const offerMatch = text.match(/offer_name:\s*(.+)/i)
+
+  const markerRegex = /\[\s*send[\s_]*payment[\s_]*link\s*\]/i
+  const offerRegex = /^\s*offer_name:\s*(.+)$/im
+
+  const hasMarker = markerRegex.test(text)
+  const offerMatch = text.match(offerRegex)
 
   const cleaned = text
-    .replace(/\[SEND_PAYMENT_LINK\]/gi, '')
-    .replace(/offer_name:\s*.+/gi, '')
+    .replace(/\[\s*send[\s_]*payment[\s_]*link\s*\]/gi, '')
+    .replace(/^\s*offer_name:\s*.+$/gim, '')
     .replace(/\[ссылка.*?\]/gi, '')
+    .replace(/\n{3,}/g, '\n\n')
     .trim()
 
   return {
-    shouldSend: hasMarker,
+    shouldSend: hasMarker || Boolean(offerMatch),
     offerName: offerMatch?.[1]?.trim() || null,
     cleanedReply: cleaned,
   }
