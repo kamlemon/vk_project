@@ -117,13 +117,32 @@ function parseAttachments(attachments) {
     switch (att.type) {
       case 'photo': {
         const photo = att.photo
-        const best  = (photo.sizes ?? []).reduce(
-          (max, s) => (s.width > (max?.width ?? 0) ? s : max), null
-        )
-        if (best?.url) {
-          result.attachment_url.push(best.url)
-          result._photo_url = result._photo_url ?? best.url
+        const sizes = (photo.sizes ?? []).filter(s => s?.url)
+
+        const preferred =
+          sizes
+            .filter(s => (s.width ?? 0) <= 1280)
+            .sort((a, b) => (b.width ?? 0) - (a.width ?? 0))[0]
+          ?? sizes.sort((a, b) => (b.width ?? 0) - (a.width ?? 0))[0]
+          ?? null
+
+        const candidates = [
+          preferred?.url ?? null,
+          photo?.orig_photo?.url ?? null,
+        ].filter(Boolean)
+
+        for (const url of candidates) {
+          if (!result.attachment_url.includes(url)) {
+            result.attachment_url.push(url)
+          }
         }
+
+        if (preferred?.url) {
+          result._photo_url = result._photo_url ?? preferred.url
+        } else if (photo?.orig_photo?.url) {
+          result._photo_url = result._photo_url ?? photo.orig_photo.url
+        }
+
         break
       }
       case 'audio_message': {
@@ -158,7 +177,56 @@ function parseAttachments(attachments) {
 
 // ── 5. transcribeAttachment ──────────────────────────────────────────────────
 
-async function transcribeAttachment(parsed) {
+function shortUrl(url) {
+  if (!url) return null
+  try {
+    const u = new URL(url)
+    return `${u.origin}${u.pathname}`
+  } catch {
+    return String(url).slice(0, 200)
+  }
+}
+
+async function fetchBinaryWithTrace(url, fallbackMime, traceId, kind) {
+  await trace(traceId, 'vk.attachment_download_start', {
+    kind,
+    url: shortUrl(url),
+  })
+
+  const res = await fetch(url)
+  const contentType = res.headers.get('content-type') ?? fallbackMime ?? null
+  const contentLength = res.headers.get('content-length') ?? null
+
+  await trace(traceId, 'vk.attachment_download_response', {
+    kind,
+    url: shortUrl(url),
+    ok: res.ok,
+    status: res.status,
+    content_type: contentType,
+    content_length: contentLength,
+  })
+
+  if (!res.ok) {
+    throw new Error(`Download failed with status ${res.status}`)
+  }
+
+  const buf = await res.arrayBuffer()
+
+  await trace(traceId, 'vk.attachment_download_done', {
+    kind,
+    url: shortUrl(url),
+    bytes: buf.byteLength,
+    content_type: contentType,
+  })
+
+  return {
+    base64: Buffer.from(buf).toString('base64'),
+    contentType,
+    bytes: buf.byteLength,
+  }
+}
+
+async function transcribeAttachment(parsed, traceId = null) {
   const empty = { transcriptions: null }
 
   if (!parsed.has_attachments) return empty
@@ -169,18 +237,37 @@ async function transcribeAttachment(parsed) {
     let parts = null
 
     if (types.includes('audio_message') && parsed._voice_ogg) {
-      const buf    = await (await fetch(parsed._voice_ogg)).arrayBuffer()
-      const base64 = Buffer.from(buf).toString('base64')
+      const audio = await fetchBinaryWithTrace(
+        parsed._voice_ogg,
+        'audio/ogg',
+        traceId,
+        'audio_message'
+      )
+
       parts = [
-        { inline_data: { mime_type: 'audio/ogg', data: base64 } },
+        { inline_data: { mime_type: audio.contentType || 'audio/ogg', data: audio.base64 } },
         { text: 'Транскрибируй это голосовое сообщение. Верни только текст, без пояснений.' },
       ]
     } else if (types.includes('photo') && parsed._photo_url) {
-      const buf    = await (await fetch(parsed._photo_url)).arrayBuffer()
-      const base64 = Buffer.from(buf).toString('base64')
-      parts = [
-        { inline_data: { mime_type: 'image/jpeg', data: base64 } },
-        { text: `Проверь, подходит ли это изображение для анализа ладони. Ответь строго на русском в формате:
+      const photoCandidates = [
+        parsed._photo_url,
+        ...(parsed.attachment_url ?? []),
+      ].filter(Boolean)
+
+      let lastError = null
+
+      for (const url of [...new Set(photoCandidates)]) {
+        try {
+          const image = await fetchBinaryWithTrace(
+            url,
+            'image/jpeg',
+            traceId,
+            'photo'
+          )
+
+          parts = [
+            { inline_data: { mime_type: image.contentType || 'image/jpeg', data: image.base64 } },
+            { text: `Проверь, подходит ли это изображение для анализа ладони. Ответь строго на русском в формате:
 verdict: palm | not_palm | unclear
 quality: good | medium | poor
 visible_palm: yes | no
@@ -195,26 +282,90 @@ details: ...
 - Не выдумывай детали, которых не видно.
 - Если verdict=unclear, напиши, что всё же удалось разобрать.
 - Если verdict=palm, отдельно укажи, какие основные линии различимы: жизни, сердца, ума, судьбы.` },
-      ]
+          ]
+
+          await trace(traceId, 'vk.gemini_request_start', {
+            kind: 'photo',
+            url: shortUrl(url),
+            bytes: image.bytes,
+            mime_type: image.contentType || 'image/jpeg',
+          })
+
+          const result = await callGeminiMultimodal(parts)
+
+          await trace(traceId, 'vk.gemini_request_done', {
+            kind: 'photo',
+            url: shortUrl(url),
+            model: result?.model ?? null,
+            has_text: Boolean(result?.text),
+            text_length: result?.text?.length ?? 0,
+          })
+
+          return {
+            transcriptions: result.text ? [result.text] : null,
+          }
+        } catch (err) {
+          lastError = err
+          await trace(traceId, 'vk.gemini_request_failed', {
+            kind: 'photo',
+            url: shortUrl(url),
+            error: err.message,
+          }, 'warn')
+        }
+      }
+
+      if (lastError) {
+        throw lastError
+      }
+
+      return empty
     } else if (types.includes('doc') && parsed._doc_url) {
-      const mimeMap = { pdf: 'application/pdf', doc: 'application/msword', docx: 'application/msword', txt: 'text/plain' }
-      const mime    = mimeMap[parsed._doc_ext?.toLowerCase()] ?? 'application/octet-stream'
-      const buf     = await (await fetch(parsed._doc_url)).arrayBuffer()
-      const base64  = Buffer.from(buf).toString('base64')
+      const mimeMap = {
+        pdf: 'application/pdf',
+        doc: 'application/msword',
+        docx: 'application/msword',
+        txt: 'text/plain',
+      }
+
+      const mime = mimeMap[parsed._doc_ext?.toLowerCase()] ?? 'application/octet-stream'
+      const doc = await fetchBinaryWithTrace(
+        parsed._doc_url,
+        mime,
+        traceId,
+        'doc'
+      )
+
       parts = [
-        { inline_data: { mime_type: mime, data: base64 } },
+        { inline_data: { mime_type: doc.contentType || mime, data: doc.base64 } },
         { text: 'Опиши содержимое этого документа. Отвечай на русском языке.' },
       ]
     } else {
       return empty
     }
 
+    await trace(traceId, 'vk.gemini_request_start', {
+      kind: types.includes('audio_message') ? 'audio_message' : 'doc',
+    })
+
     const result = await callGeminiMultimodal(parts)
+
+    await trace(traceId, 'vk.gemini_request_done', {
+      kind: types.includes('audio_message') ? 'audio_message' : 'doc',
+      model: result?.model ?? null,
+      has_text: Boolean(result?.text),
+      text_length: result?.text?.length ?? 0,
+    })
+
     return {
       transcriptions: result.text ? [result.text] : null,
     }
 
   } catch (err) {
+    await trace(traceId, 'vk.attachment_transcription_failed', {
+      attachment_types: parsed.attachment_types ?? null,
+      error: err.message,
+    }, 'error')
+
     console.error('[transcribeAttachment] failed:', err.message)
     return empty
   }
@@ -266,7 +417,7 @@ async function saveMessageFromVk(body, traceId) {
   // Вложения
   const parsed         = parseAttachments(attachments)
   await trace(traceId, 'vk.attachments_parsed', parsed)
-  const { transcriptions } = await transcribeAttachment(parsed)
+  const { transcriptions } = await transcribeAttachment(parsed, traceId)
 
   await trace(traceId, 'vk.attachment_transcribed', {
     has_transcriptions: Boolean(transcriptions),
