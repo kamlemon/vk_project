@@ -187,16 +187,6 @@ export default async function handler(req, res) {
 
       if (updErr) throw updErr
 
-      await trace(traceId, 'cron.product_cycle_step_sent', {
-        dialog_id: dialog.id,
-        user_id: dialog.vk_user_id,
-        previous_step: step,
-        new_status_id: patch.status_id,
-        new_product_step: patch.product_step,
-        next_action_at: patch.next_action_at ?? null,
-        legacy_detected: legacyDetected,
-      })
-
       sent.push({
         dialog_id: dialog.id,
         user_id: dialog.vk_user_id,
@@ -206,12 +196,6 @@ export default async function handler(req, res) {
         legacy_detected: legacyDetected,
       })
     }
-
-    await trace(traceId, 'cron.product_cycle_done', {
-      dialogs_seen: dialogs.length,
-      sent_count: sent.length,
-      skipped_count: skipped.length,
-    })
 
     return res.status(200).json({
       ok: true,

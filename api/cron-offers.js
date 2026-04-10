@@ -85,13 +85,6 @@ export default async function handler(req, res) {
       await sendMessage(dialog.vk_user_id, prompt3)
       await updateDialogAfterOffer(dialog, nowIso)
 
-      await trace(traceId, 'cron.offer_sent', {
-        dialog_id: dialog.id,
-        vk_user_id: dialog.vk_user_id,
-        previous_status_id: dialog.status_id,
-        new_status_id: 5,
-      })
-
       sent.push({
         dialog_id: dialog.id,
         vk_user_id: dialog.vk_user_id,
@@ -99,12 +92,6 @@ export default async function handler(req, res) {
         new_status_id: 5,
       })
     }
-
-    await trace(traceId, 'cron.offers_done', {
-      dialogs_seen: dialogs.length,
-      sent_count: sent.length,
-      sent,
-    })
 
     return res.status(200).json({ ok: true, sent })
   } catch (err) {

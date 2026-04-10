@@ -150,14 +150,6 @@ export default async function handler(req, res) {
         },
       }
 
-      await trace(traceId, 'cron.pending_replies_dispatch', {
-        dialog_id: dialogId,
-        latest_message_id: latest.id,
-        representative_message_id: representative.id,
-        batch_size: items.length,
-        message_ids: items.map(x => x.id),
-      })
-
       await routerHandler(fakeReq, makeFakeRes())
 
       const otherIds = items
@@ -174,13 +166,6 @@ export default async function handler(req, res) {
         other_marked_replied: otherIds,
       })
     }
-
-    await trace(traceId, 'cron.pending_replies_done', {
-      processed_count: processed.length,
-      skipped_count: skipped.length,
-      processed,
-      skipped,
-    })
 
     return res.status(200).json({
       ok: true,
