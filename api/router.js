@@ -863,10 +863,10 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
       deal_id: dealId,
     })
 
-    const reply = `${name}, вот ссылка на оплату тестового платежа ${amount} ₽:
+    const reply = `${name}, вот ссылка на тестовую оплату ${amountLabel} для практики «${offerLabel}»:
 ${init.formUrl}
 
-Как только оплата пройдет, я сразу увижу подтверждение и переведу тебя в следующий этап.`
+Как только оплата пройдёт, я увижу подтверждение и напишу тебе дальше.`
 
     await saveReply({
       dialogId,
