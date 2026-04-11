@@ -1,6 +1,7 @@
 import pendingRepliesHandler from './cron-pending-replies.js'
 import offersHandler from './cron-offers.js'
 import productCycleHandler from './cron-product-cycle.js'
+import tarotReadingsHandler from './cron-tarot-readings.js'
 
 function createMockRes() {
   return {
@@ -62,12 +63,14 @@ export default async function handler(req, res) {
     const pendingReplies = await runInternal('cron-pending-replies', pendingRepliesHandler, req)
     const offers = await runInternal('cron-offers', offersHandler, req)
     const productCycle = await runInternal('cron-product-cycle', productCycleHandler, req)
+    const tarotReadings = await runInternal('cron-tarot-readings', tarotReadingsHandler, req)
 
     return res.status(200).json({
       ok: true,
       pendingReplies,
       offers,
       productCycle,
+      tarotReadings,
     })
   } catch (err) {
     return res.status(500).json({

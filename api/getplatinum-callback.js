@@ -5,6 +5,95 @@ import { sendMessage } from '../lib/vk.js'
 
 const PAID_PRODUCT_ID = 2
 
+
+function plusMinutesIso(minutes) {
+  return new Date(Date.now() + minutes * 60 * 1000).toISOString()
+}
+
+function cardsCountByProductId(productId) {
+  if (Number(productId) === 2) return 3
+  if (Number(productId) === 3) return 5
+  return null
+}
+
+function shuffleArray(items) {
+  const arr = [...items]
+  for (let i = arr.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[arr[i], arr[j]] = [arr[j], arr[i]]
+  }
+  return arr
+}
+
+function randomReversed() {
+  return Math.random() < 0.3
+}
+
+async function ensureTarotReading({ dialogId, vkUserId, productId, topic = null, questionText = null }) {
+  const cardsCount = cardsCountByProductId(productId)
+  if (!cardsCount) return null
+
+  const { data: dialogRow } = await supabase
+    .from('dialog')
+    .select('current_reading_id')
+    .eq('id', dialogId)
+    .maybeSingle()
+
+  if (dialogRow?.current_reading_id) {
+    const { data: existing } = await supabase
+      .from('tarot_reading')
+      .select('*')
+      .eq('id', dialogRow.current_reading_id)
+      .maybeSingle()
+
+    if (existing) return existing
+  }
+
+  const { data: cards, error: cardsError } = await supabase
+    .from('tarot_card')
+    .select('card_code')
+    .eq('deck_code', 'RWS')
+    .eq('is_available', true)
+
+  if (cardsError) throw cardsError
+  if (!cards || cards.length < cardsCount) {
+    throw new Error(`Not enough tarot cards for reading: need ${cardsCount}, got ${cards?.length ?? 0}`)
+  }
+
+  const picked = shuffleArray(cards).slice(0, cardsCount)
+  const reversedFlags = picked.map(() => randomReversed())
+
+  const payload = {
+    dialog_id: dialogId,
+    vk_user_id: vkUserId,
+    product_id: Number(productId),
+    topic: topic ?? null,
+    question_text: questionText ?? topic ?? null,
+    cards_count: cardsCount,
+    card_1_code: picked[0]?.card_code ?? null,
+    card_1_reversed: reversedFlags[0] ?? false,
+    card_2_code: picked[1]?.card_code ?? null,
+    card_2_reversed: reversedFlags[1] ?? false,
+    card_3_code: picked[2]?.card_code ?? null,
+    card_3_reversed: reversedFlags[2] ?? false,
+    card_4_code: picked[3]?.card_code ?? null,
+    card_4_reversed: reversedFlags[3] ?? false,
+    card_5_code: picked[4]?.card_code ?? null,
+    card_5_reversed: reversedFlags[4] ?? false,
+    cards_signature: picked.map((card, idx) => `${card.card_code}:${reversedFlags[idx] ? 'r' : 'u'}`).join('|'),
+    delivery_step: 0,
+  }
+
+  const { data: inserted, error: insertError } = await supabase
+    .from('tarot_reading')
+    .insert(payload)
+    .select('*')
+    .single()
+
+  if (insertError) throw insertError
+  return inserted
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' })
@@ -87,6 +176,31 @@ export default async function handler(req, res) {
     notification_type: notificationType,
   })
 
+    let tarotReadingId = null
+    let tarotNextActionAt = null
+
+    if ([2, 3].includes(Number(productId))) {
+      const { data: dialogMeta, error: dialogMetaError } = await supabase
+        .from('dialog')
+        .select('selected_topic, current_reading_id')
+        .eq('id', payment.dialog_id)
+        .maybeSingle()
+
+      if (dialogMetaError) throw dialogMetaError
+
+      const reading = await ensureTarotReading({
+        dialogId: payment.dialog_id,
+        vkUserId: payment.vk_user_id,
+        productId,
+        topic: dialogMeta?.selected_topic ?? null,
+        questionText: dialogMeta?.selected_topic ?? null,
+      })
+
+      tarotReadingId = reading?.id ?? null
+      tarotNextActionAt = plusMinutesIso(1)
+    }
+
+
   if (notificationType === 1 && isSuccess) {
     const productId = Number(body?.customParams?.productId ?? PAID_PRODUCT_ID) || PAID_PRODUCT_ID
     const offerName = body?.customParams?.offerName ?? null
@@ -133,7 +247,8 @@ export default async function handler(req, res) {
       vk_user_id: payment.vk_user_id,
       product_id: productId,
       product_step: 0,
-      next_action_at: null,
+      next_action_at: [2, 3].includes(Number(productId)) ? tarotNextActionAt : null,
+      current_reading_id: [2, 3].includes(Number(productId)) ? tarotReadingId : null,
       offer_name: offerName,
     })
 

@@ -142,6 +142,14 @@ export default async function handler(req, res) {
     const skipped = []
 
     for (const dialog of dialogs) {
+      if ([2, 3].includes(Number(dialog.selected_product_id ?? 0)) || dialog.current_reading_id) {
+        skipped.push({
+          dialog_id: dialog.id,
+          reason: 'handled_by_tarot_cycle',
+        })
+        continue
+      }
+
       const productId = Number(dialog.product_id ?? PAID_PRODUCT_ID) || PAID_PRODUCT_ID
 
       let step = Number(dialog.product_step ?? 0)
