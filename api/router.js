@@ -7,8 +7,6 @@ import { initPaymentUrl } from '../lib/getplatinum.js'
 
 const DIAGNOSIS_MARKER = '[ДИАГНОСТИКА_ВЫПОЛНЕНА]'
 const PAYMENT_LINK_TRIGGER_RE = /(давай ссылку|хочу ссылку|хочу оплатить|готов оплатить|оплатить|оплачиваю|беру)/i
-const TEST_PAYMENT_AMOUNT = 1000
-const PAID_PRODUCT_ID = 2
 const PRODUCT_CYCLE_REPLY_GRACE_MINUTES = Number(process.env.PRODUCT_CYCLE_REPLY_GRACE_MINUTES ?? 3)
 
 function maybePushNextActionAt(dialog) {
@@ -53,6 +51,64 @@ async function getProduct(productId) {
 
   if (!data) await log('router', `Продукт ${productId} не найден`, null, 'warn')
   return data?.description ?? null
+}
+
+
+async function getProductRecordById(productId) {
+  if (!productId) return null
+
+  const { data } = await supabase
+    .from('product')
+    .select('product_id, name, description, price_minor, price_rub')
+    .eq('product_id', productId)
+    .maybeSingle()
+
+  return data ?? null
+}
+
+async function getProductRecordByName(name) {
+  const exactName = String(name ?? '').trim()
+  if (!exactName) return null
+
+  let { data } = await supabase
+    .from('product')
+    .select('product_id, name, description, price_minor, price_rub')
+    .eq('name', exactName)
+    .maybeSingle()
+
+  if (data) return data
+
+  const inferredId = inferTarotProductId(exactName)
+  if (!inferredId) return null
+
+  return await getProductRecordById(inferredId)
+}
+
+function inferTarotProductId(text) {
+  const t = String(text ?? '').toLowerCase()
+
+  if (/(^|\s)(5|пять)\s*-?\s*(карт|карты|картах)/i.test(t) || /расклад\s*на\s*5/i.test(t)) return 3
+  if (/(^|\s)(3|три)\s*-?\s*(карт|карты|картах)/i.test(t) || /расклад\s*на\s*3/i.test(t)) return 2
+
+  return null
+}
+
+function inferTarotTopic(text) {
+  const t = String(text ?? '').toLowerCase()
+
+  if (/(отношени|любов|партн|бывш|муж|жена|пара)/i.test(t)) return 'отношения'
+  if (/(деньг|финанс|доход|заработ)/i.test(t)) return 'деньги'
+  if (/(работ|карьер|бизнес)/i.test(t)) return 'работа'
+  if (/(будущ|что дальше|что ждет|что ждёт)/i.test(t)) return 'будущее'
+  if (/(общее|общий вопрос|в целом)/i.test(t)) return 'общее'
+
+  return null
+}
+
+function getTarotProductNameById(productId) {
+  if (productId === 2) return 'Расклад таро на 3 карты'
+  if (productId === 3) return 'Расклад таро на 5 карт'
+  return null
 }
 
 function buildFullPrompt(prompt, productDescription = null) {
@@ -104,6 +160,28 @@ function buildPostProductSalesGuard(dialog) {
 - Если клиент уже назвал направление, предложи следующий релевантный продукт или формат работы под этот запрос.
 - Не отправляй ссылку на оплату сразу после первого же запроса на ссылку. Сначала уточни направление или подтверди, какой следующий продукт ему подходит.
 - Не описывай это как повтор прошлой практики.`
+}
+
+
+function buildStatus5SelectionContext(dialog) {
+  const lines = []
+
+  const productName = getTarotProductNameById(dialog?.selected_product_id)
+  if (productName) {
+    lines.push(`- В диалоге уже выбран продукт: ${productName}.`)
+  }
+
+  if (dialog?.selected_topic) {
+    lines.push(`- В диалоге уже выбрана тема расклада: ${dialog.selected_topic}.`)
+  }
+
+  if (!lines.length) return ''
+
+  return `
+
+Контекст текущего выбора:
+${lines.join('\n')}
+- Не проси повторно то, что уже известно.`
 }
 
 function buildPaymentLinkMarkerGuard() {
@@ -840,11 +918,8 @@ async function handleStatus5PostProductQualification({ dialog, userId, firstName
   })
 }
 
-async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMessageId, traceId, offerName = null, prefaceText = null }) {
+async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMessageId, traceId, offerName = null, prefaceText = null, selectedProductId = null }) {
   const dialogId = dialog.id
-  const amount = TEST_PAYMENT_AMOUNT
-  const amountLabel = formatRubFromMinor(amount)
-  const offerLabel = (offerName ?? '').trim() || 'выбранной практики'
   const email = process.env.GETPLATINUM_TEST_EMAIL ?? null
   const phone = process.env.GETPLATINUM_TEST_PHONE ?? null
   const notificationUrl = process.env.GETPLATINUM_NOTIFICATION_URL ?? null
@@ -861,6 +936,26 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
       throw new Error('GetPlatinum notification/success/fail URLs are not configured')
     }
 
+    const product =
+      (selectedProductId ? await getProductRecordById(selectedProductId) : null) ||
+      (offerName ? await getProductRecordByName(offerName) : null)
+
+    if (!product) {
+      throw new Error('Selected tarot product not found in product table')
+    }
+
+    const productId = Number(product.product_id)
+    const amount = Number(product.price_minor ?? 0)
+    const offerLabel = String(product.name ?? '').trim() || 'выбранный продукт'
+    const amountRub = Number(product.price_rub ?? 0)
+    const amountLabel = Number.isFinite(amountRub) && amountRub > 0
+      ? `${amountRub} ₽`
+      : formatRubFromMinor(amount)
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new Error(`Invalid product price_minor for product_id=${productId}`)
+    }
+
     const dealId = `vk-${dialogId}-${Date.now()}`
     await trace(traceId, 'router.getplatinum_payment_payload_preview', {
       dialog_id: dialogId,
@@ -873,6 +968,8 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
       notification_url: notificationUrl,
       success_url: successUrl,
       fail_url: failUrl,
+      product_id: productId,
+      offer_name: offerLabel,
       position_prefix: 9,
       position_prefix_type: typeof 9,
       vat: 'none',
@@ -893,7 +990,7 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
       customParams: {
         dialogId,
         vkUserId: userId,
-        productId: PAID_PRODUCT_ID,
+        productId,
         offerName: offerLabel,
         source: 'vk_bot',
       },
@@ -906,6 +1003,8 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
       deal_id: dealId,
       amount,
       form_url: init.formUrl,
+      product_id: productId,
+      offer_name: offerLabel,
     })
 
     const { error: paymentErr } = await supabase
@@ -927,9 +1026,10 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
     await trace(traceId, 'router.payment_saved', {
       dialog_id: dialogId,
       deal_id: dealId,
+      product_id: productId,
     })
 
-    const reply = `${name}, вот ссылка на тестовую оплату ${amountLabel} для практики «${offerLabel}»:
+    const reply = `${name}, вот ссылка на тестовую оплату ${amountLabel} для продукта «${offerLabel}»:
 ${init.formUrl}
 
 Как только оплата пройдёт, я увижу подтверждение и напишу тебе дальше.`
@@ -945,10 +1045,11 @@ ${init.formUrl}
     await markReplied(incomingMessageId)
 
     await updateDialog(dialogId, {
-      status_id: 5,
+      selected_product_id: productId,
       message_count: (dialog.message_count ?? 0) + 1,
       last_message_at: new Date().toISOString(),
       last_message_by: 'bot',
+      status_id: 5,
     })
 
     await maybeSendMessage({
@@ -959,6 +1060,7 @@ ${init.formUrl}
       extra: {
         prompt_id: 'getplatinum_link',
         deal_id: dealId,
+        product_id: productId,
       },
     })
 
@@ -981,10 +1083,10 @@ ${init.formUrl}
     await markReplied(incomingMessageId)
 
     await updateDialog(dialogId, {
-      status_id: 5,
       message_count: (dialog.message_count ?? 0) + 1,
       last_message_at: new Date().toISOString(),
       last_message_by: 'bot',
+      status_id: 5,
     })
 
     await maybeSendMessage({
@@ -1005,10 +1107,30 @@ async function handleStatus5({ dialog, userId, text, userContext, incomingMessag
   const dialogId = dialog.id
 
   const incomingMessage = await getIncomingMessage(incomingMessageId)
+  const inferredProductId = inferTarotProductId(text)
+  const inferredTopic = inferTarotTopic(text)
+
+  let dialogState = dialog
+  const selectionPatch = {}
+
+  if (inferredProductId && inferredProductId !== dialog.selected_product_id) {
+    selectionPatch.selected_product_id = inferredProductId
+  }
+
+  if (inferredTopic && inferredTopic !== dialog.selected_topic) {
+    selectionPatch.selected_topic = inferredTopic
+  }
+
+  if (Object.keys(selectionPatch).length) {
+    await updateDialog(dialogId, selectionPatch)
+    dialogState = { ...dialog, ...selectionPatch }
+  }
+
   const prompt = await getPrompt(4)
   const fullPrompt =
     (prompt ?? '') +
-    buildPostProductSalesGuard(dialog) +
+    buildStatus5SelectionContext(dialogState) +
+    buildPostProductSalesGuard(dialogState) +
     buildPaymentLinkMarkerGuard()
   const history = await getHistory(dialogId)
   const llmText = buildLLMUserText(text, incomingMessage)
@@ -1017,7 +1139,7 @@ async function handleStatus5({ dialog, userId, text, userContext, incomingMessag
     dialog_id: dialog.id,
     status_id: 5,
     prompt_id: 4,
-    system_prompt: prompt,
+    system_prompt: fullPrompt,
     user_context: userContext,
     history,
     user_message: llmText,
@@ -1034,19 +1156,25 @@ async function handleStatus5({ dialog, userId, text, userContext, incomingMessag
   })
 
   const paymentDecision = extractPaymentLinkDecision(reply)
+  const selectedProductId =
+    dialogState.selected_product_id ??
+    inferredProductId ??
+    inferTarotProductId(paymentDecision.offerName)
+
   const shouldSendLink =
     paymentDecision.shouldSend ||
-    (isPaymentLinkRequest(text) && !hasCompletedPaidCycle(dialog))
+    (isPaymentLinkRequest(text) && !hasCompletedPaidCycle(dialogState) && Boolean(selectedProductId))
 
   if (shouldSendLink) {
     return await handleStatus5PaymentLink({
-      dialog,
+      dialog: dialogState,
       userId,
       firstName,
       incomingMessageId,
       traceId,
       offerName: paymentDecision.offerName,
       prefaceText: paymentDecision.cleanedReply || 'Отправляю ссылку на оплату.',
+      selectedProductId,
     })
   }
 
