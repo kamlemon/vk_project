@@ -146,36 +146,6 @@ function formatRubFromMinor(amountMinor) {
   return `${rub.toFixed(2).replace('.', ',')} ₽`
 }
 
-function splitTaggedBotMessages(text) {
-  const raw = String(text ?? '').trim()
-  if (!raw) return []
-
-  return raw
-    .split(/\[Новое сообщение\]/gi)
-    .map(part => part.replace(/\[Новое сообщение\]/gi, '').trim())
-    .filter(Boolean)
-}
-
-function normalizeBotReplyForStorage(text) {
-  const parts = splitTaggedBotMessages(text)
-  if (!parts.length) return String(text ?? '').trim()
-  return parts.join('\n\n').trim()
-}
-
-function estimateTypingDelayMs(text) {
-  const clean = String(text ?? '').replace(/\s+/g, ' ').trim()
-  const chars = clean.length
-
-  const typingMs = 700 + chars * 22
-  const readingMs = 500 + Math.ceil(chars / 80) * 350
-
-  return Math.max(1200, Math.min(6500, typingMs + readingMs))
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
-
 function isReadyToStartMessage(text) {
   const t = String(text ?? '').toLowerCase()
   return /\b(готов|готова|готов начать|готова начать|давай начн[её]м|можно начинать|начинаем|поехали)\b/.test(t)
@@ -241,37 +211,42 @@ async function getStaticPrompt(promptId) {
 }
 
 async function maybeSendMessage({ userId, text, traceId, statusId, extra = {} }) {
-  if (!userId || !text) return
+  await trace(traceId ?? `send-${userId}-${Date.now()}`, 'router.send_attempt', {
+    user_id: userId,
+    status_id: statusId,
+    text_preview: text ? text.slice(0, 200) : '',
+    ...extra,
+  })
 
-  const parts = splitTaggedBotMessages(text)
-  const messages = parts.length ? parts : [String(text).trim()].filter(Boolean)
-
-  for (let i = 0; i < messages.length; i += 1) {
-    const part = messages[i]
-
-    await trace(traceId, 'router.send_attempt', {
+  if (process.env.DEBUG_NO_SEND === 'true') {
+    await trace(traceId ?? `send-${userId}-${Date.now()}`, 'router.send_skipped', {
+      reason: 'DEBUG_NO_SEND=true',
       user_id: userId,
       status_id: statusId,
-      text_preview: part.slice(0, 200),
-      chunk_index: i + 1,
-      chunk_count: messages.length,
       ...extra,
     })
+    return null
+  }
 
-    const result = await sendMessage(userId, part)
+  try {
+    const result = await sendMessage(userId, text)
 
-    await trace(traceId, 'router.send_success', {
+    await trace(traceId ?? `send-${userId}-${Date.now()}`, 'router.send_success', {
       user_id: userId,
       status_id: statusId,
       result,
-      chunk_index: i + 1,
-      chunk_count: messages.length,
       ...extra,
     })
 
-    if (i < messages.length - 1) {
-      await sleep(estimateTypingDelayMs(part))
-    }
+    return result
+  } catch (err) {
+    await trace(traceId ?? `send-${userId}-${Date.now()}`, 'router.send_failed', {
+      user_id: userId,
+      status_id: statusId,
+      error: err.message,
+      ...extra,
+    }, 'error')
+    throw err
   }
 }
 
@@ -310,8 +285,7 @@ async function getDialog(userId) {
 
 // ── Сохранение ответа бота ───────────────────────────────────────────────────
 
-\1
-  reply = normalizeBotReplyForStorage(reply)
+async function saveReply({ dialogId, userId, reply, usedModel, replyToId, llmInput, llmOutput }) {
   await supabase.from('message').insert({
     dialog_id:   dialogId,
     from_id:     userId,
