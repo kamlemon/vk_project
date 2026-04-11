@@ -105,6 +105,29 @@ function inferTarotTopic(text) {
   return null
 }
 
+
+function isPriceQuestion(text) {
+  const t = String(text ?? '').toLowerCase()
+  return /(сколько стоит|какая цена|по стоимости|цена|поч[её]м|сколько по деньгам)/i.test(t)
+}
+
+function buildTarotPriceReply(product, topic = null) {
+  const productName = String(product?.name ?? '').trim() || 'расклад'
+  const priceRub = Number(product?.price_rub ?? 0)
+  const priceMinor = Number(product?.price_minor ?? 0)
+  const priceLabel = priceRub > 0 ? `${priceRub} ₽` : formatRubFromMinor(priceMinor)
+
+  if (topic) {
+    return `${productName} по теме «${topic}» стоит ${priceLabel}.
+
+Если всё подходит, я сразу отправлю ссылку на оплату.`
+  }
+
+  return `${productName} стоит ${priceLabel}.
+
+Остаётся только понять тему расклада - отношения, работа, деньги, будущее или общий вопрос.`
+}
+
 function getTarotProductNameById(productId) {
   if (productId === 2) return 'Расклад таро на 3 карты'
   if (productId === 3) return 'Расклад таро на 5 карт'
@@ -979,7 +1002,7 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
       dealId,
       amount,
       currency: 'RUB',
-      title: `Тестовая оплата: ${offerLabel}`,
+      title: `Оплата: ${offerLabel}`,
       clientId: `vk-${userId}`,
       email,
       phone,
@@ -1029,7 +1052,7 @@ async function handleStatus5PaymentLink({ dialog, userId, firstName, incomingMes
       product_id: productId,
     })
 
-    const reply = `${name}, вот ссылка на тестовую оплату ${amountLabel} для продукта «${offerLabel}»:
+    const reply = `${name}, вот ссылка на оплату «${offerLabel}» - ${amountLabel}:
 ${init.formUrl}
 
 Как только оплата пройдёт, я увижу подтверждение и напишу тебе дальше.`
@@ -1126,6 +1149,40 @@ async function handleStatus5({ dialog, userId, text, userContext, incomingMessag
     dialogState = { ...dialog, ...selectionPatch }
   }
 
+  if (isPriceQuestion(text) && dialogState.selected_product_id) {
+    const product = await getProductRecordById(dialogState.selected_product_id)
+
+    if (product) {
+      const reply = buildTarotPriceReply(product, dialogState.selected_topic)
+
+      await saveReply({
+        dialogId,
+        userId,
+        reply,
+        usedModel: 'system-price',
+        replyToId: incomingMessageId,
+      })
+
+      await markReplied(incomingMessageId)
+
+      await updateDialog(dialogId, {
+        message_count: (dialog.message_count ?? 0) + 1,
+        last_message_at: new Date().toISOString(),
+        last_message_by: 'bot',
+        status_id: 5,
+      })
+
+      await maybeSendMessage({
+        userId,
+        text: reply,
+        traceId,
+        statusId: 5,
+        extra: { prompt_id: 'system_price_reply', product_id: product.product_id },
+      })
+      return
+    }
+  }
+
   const prompt = await getPrompt(4)
   const fullPrompt =
     (prompt ?? '') +
@@ -1205,6 +1262,32 @@ async function handleStatus6({ dialog, userId, text, userContext, incomingMessag
   const incomingMessage = await getIncomingMessage(incomingMessageId)
   const paidOfferMeta = await getLatestPaidOfferMeta(dialogId)
   const offerName = paidOfferMeta.offerName ?? null
+
+  if ([2, 3].includes(Number(dialog.selected_product_id ?? 0))) {
+    const topicLabel = dialog.selected_topic ? ` по теме «${dialog.selected_topic}»` : ''
+    const reply = offerName
+      ? `Оплату за «${offerName}» вижу, спасибо. Расклад${topicLabel} уже в работе. Дальше я пришлю карты по одной и сразу дам разбор каждой.`
+      : `Оплату вижу, спасибо. Расклад${topicLabel} уже в работе. Дальше я пришлю карты по одной и сразу дам разбор каждой.`
+
+    await saveReply({ dialogId, userId, reply, usedModel: 'system-status-6-tarot', replyToId: incomingMessageId })
+    await markReplied(incomingMessageId)
+
+    await updateDialog(dialogId, {
+      message_count: (dialog.message_count ?? 0) + 1,
+      last_message_at: new Date().toISOString(),
+      last_message_by: 'bot',
+      status_id: 6,
+    })
+
+    await maybeSendMessage({
+      userId,
+      text: reply,
+      traceId,
+      statusId: 6,
+      extra: { prompt_id: 'status6_tarot_support', offer_name: offerName },
+    })
+    return
+  }
 
   if (!dialog.cycle_started_at) {
     const ready = isReadyToStartMessage(text)
