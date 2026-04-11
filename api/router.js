@@ -23,6 +23,10 @@ function maybePushNextActionAt(dialog) {
   return { next_action_at: minNextActionAt.toISOString() }
 }
 
+function plusMinutesIso(minutes) {
+  return new Date(Date.now() + minutes * 60 * 1000).toISOString()
+}
+
 
 
 // ── Загрузка промпта из БД ───────────────────────────────────────────────────
@@ -153,6 +157,37 @@ function normalizeBotText(text) {
     .trim()
 }
 
+function splitTaggedBotMessages(text) {
+  const raw = String(text ?? '').trim()
+  if (!raw) return []
+
+  return raw
+    .split(/\[Новое сообщение\]/gi)
+    .map(part => normalizeBotText(part))
+    .filter(Boolean)
+}
+
+function normalizeBotReplyForStorage(text) {
+  const parts = splitTaggedBotMessages(text)
+  if (!parts.length) return normalizeBotText(text)
+  return parts.join('\n\n').trim()
+}
+
+function estimateTypingDelayMs(text) {
+  const clean = normalizeBotText(text)
+  const chars = clean.length
+
+  const typingMs = 700 + chars * 22
+  const readingMs = 500 + Math.ceil(chars / 80) * 350
+
+  return Math.max(1200, Math.min(6500, typingMs + readingMs))
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+
 function isReadyToStartMessage(text) {
   const t = String(text ?? '').toLowerCase()
   return /\b(готов|готова|готов начать|готова начать|давай начн[её]м|можно начинать|начинаем|поехали)\b/.test(t)
@@ -218,46 +253,68 @@ async function getStaticPrompt(promptId) {
 }
 
 async function maybeSendMessage({ userId, text, traceId, statusId, extra = {} }) {
-  text = normalizeBotText(text)
-  await trace(traceId ?? `send-${userId}-${Date.now()}`, 'router.send_attempt', {
-    user_id: userId,
-    status_id: statusId,
-    text_preview: text ? text.slice(0, 200) : '',
-    ...extra,
-  })
+  if (!userId || !text) return null
+
+  const messages = splitTaggedBotMessages(text)
+  const parts = messages.length ? messages : [normalizeBotText(text)].filter(Boolean)
+  const currentTraceId = traceId ?? `send-${userId}-${Date.now()}`
 
   if (process.env.DEBUG_NO_SEND === 'true') {
-    await trace(traceId ?? `send-${userId}-${Date.now()}`, 'router.send_skipped', {
+    await trace(currentTraceId, 'router.send_skipped', {
       reason: 'DEBUG_NO_SEND=true',
       user_id: userId,
       status_id: statusId,
+      chunk_count: parts.length,
       ...extra,
     })
     return null
   }
 
-  try {
-    const result = await sendMessage(userId, text)
+  let lastResult = null
 
-    await trace(traceId ?? `send-${userId}-${Date.now()}`, 'router.send_success', {
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i]
+
+    await trace(currentTraceId, 'router.send_attempt', {
       user_id: userId,
       status_id: statusId,
-      result,
+      text_preview: part.slice(0, 200),
+      chunk_index: i + 1,
+      chunk_count: parts.length,
       ...extra,
     })
 
-    return result
-  } catch (err) {
-    await trace(traceId ?? `send-${userId}-${Date.now()}`, 'router.send_failed', {
-      user_id: userId,
-      status_id: statusId,
-      error: err.message,
-      ...extra,
-    }, 'error')
-    throw err
-  }
-}
+    try {
+      const result = await sendMessage(userId, part)
+      lastResult = result
 
+      await trace(currentTraceId, 'router.send_success', {
+        user_id: userId,
+        status_id: statusId,
+        result,
+        chunk_index: i + 1,
+        chunk_count: parts.length,
+        ...extra,
+      })
+    } catch (err) {
+      await trace(currentTraceId, 'router.send_failed', {
+        user_id: userId,
+        status_id: statusId,
+        error: err.message,
+        chunk_index: i + 1,
+        chunk_count: parts.length,
+        ...extra,
+      }, 'error')
+      throw err
+    }
+
+    if (i < parts.length - 1) {
+      await sleep(estimateTypingDelayMs(part))
+    }
+  }
+
+  return lastResult
+}
 
 // ── Загрузка истории диалога ─────────────────────────────────────────────────
 
@@ -294,7 +351,7 @@ async function getDialog(userId) {
 // ── Сохранение ответа бота ───────────────────────────────────────────────────
 
 async function saveReply({ dialogId, userId, reply, usedModel, replyToId, llmInput, llmOutput }) {
-  reply = normalizeBotText(reply)
+  reply = normalizeBotReplyForStorage(reply)
   await supabase.from('message').insert({
     dialog_id:   dialogId,
     from_id:     userId,
@@ -609,7 +666,7 @@ async function handleStatus3({
       dialog_id: dialog.id,
       status_id: 3,
       prompt_id: 2,
-      system_prompt: fullPrompt,
+      system_prompt: prompt,
       user_context: userContext,
       history,
       user_message: llmText,
