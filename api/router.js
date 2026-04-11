@@ -146,6 +146,13 @@ function formatRubFromMinor(amountMinor) {
   return `${rub.toFixed(2).replace('.', ',')} ₽`
 }
 
+function normalizeBotText(text) {
+  return String(text ?? '')
+    .replace(/[—–]/g, '-')
+    .replace(/\u00A0/g, ' ')
+    .trim()
+}
+
 function isReadyToStartMessage(text) {
   const t = String(text ?? '').toLowerCase()
   return /\b(готов|готова|готов начать|готова начать|давай начн[её]м|можно начинать|начинаем|поехали)\b/.test(t)
@@ -211,6 +218,7 @@ async function getStaticPrompt(promptId) {
 }
 
 async function maybeSendMessage({ userId, text, traceId, statusId, extra = {} }) {
+  text = normalizeBotText(text)
   await trace(traceId ?? `send-${userId}-${Date.now()}`, 'router.send_attempt', {
     user_id: userId,
     status_id: statusId,
@@ -286,6 +294,7 @@ async function getDialog(userId) {
 // ── Сохранение ответа бота ───────────────────────────────────────────────────
 
 async function saveReply({ dialogId, userId, reply, usedModel, replyToId, llmInput, llmOutput }) {
+  reply = normalizeBotText(reply)
   await supabase.from('message').insert({
     dialog_id:   dialogId,
     from_id:     userId,
